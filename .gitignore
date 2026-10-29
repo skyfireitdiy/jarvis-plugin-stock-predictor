@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 测试/临时
+*.log
+.DS_Store
