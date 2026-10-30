@@ -1,17 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-stock-predictor 插件私有功能（运行于 gateway，供 Agent 工具薄封装调用）。
+stock-predictor 插件数据层（运行于 gateway，供 Agent 工具与前端调用）。
+
+设计原则：**本模块只负责"取数据"与"算指标"，不做任何主观判断。**
+所有打分、权重、方向判定、涨跌幅区间、置信度均由 Agent（大模型）基于
+本模块提供的原始数据自行分析得出。理由：
+  1. 大模型能理解语义（新闻、题材、盘口异动），规则引擎只能做关键词计数；
+  2. 分析口径可随市场环境调整，无需改代码；
+  3. 避免"规则结论"束缚 Agent 的判断。
 
 职责：
-  1. A股数据接入（akshare 多源：东财主源 + 新浪备用源，含缓存/重试/降级）
-  2. 技术指标计算（MA/MACD/RSI/BOLL/量比/换手）
-  3. 五维打分引擎（量价技术面 40% / 资金结构面 25% / 情绪题材面 20% / 大盘环境 10% / 消息事件面 5%）
-  4. 综合输出：方向 + 涨跌幅区间 + 触发信号 + 置信度 + 逐项证据
+  1. A股数据接入（akshare 多源：东财主源 + 新浪/腾讯备用源，含缓存/重试/降级）
+  2. 技术指标计算（MA/MACD/RSI/BOLL/量比/换手/ATR）——纯数学计算，不含判断
+  3. 盘中实时快照（新浪分时主源 + 腾讯逐笔备用）
+  4. get_snapshot() 汇总全部原始数据，一次性交给 Agent
+  5. get_snapshot_json() 同上但纯 JSON 化，供前端侧边栏展示
 
 安全边界：本文件属于插件私有功能，不直接暴露给 Agent；
 仅 PUBLIC_FUNCTIONS 白名单内的函数可被 gateway 前端代理调用。
 """
-
 import time
 import math
 import threading
@@ -29,39 +36,10 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # 常量与配置
 # ---------------------------------------------------------------------------
-WEIGHTS = {
-    "tech": 0.40,       # 量价技术面
-    "fund": 0.25,       # 资金结构面
-    "sentiment": 0.20,  # 情绪题材面
-    "market": 0.10,     # 大盘环境
-    "news": 0.05,       # 消息事件面
-}
-
-DIM_NAMES = {
-    "tech": "量价技术面",
-    "fund": "资金结构面",
-    "sentiment": "情绪题材面",
-    "market": "大盘环境",
-    "news": "消息事件面",
-    "intraday": "盘中走势",
-}
-
-# 盘中权重（新增 intraday 维度，tech 降权：盘中时今日走势比昨日技术形态更重要）
-WEIGHTS_INTRADAY = {
-    "tech": 0.25,
-    "intraday": 0.20,
-    "fund": 0.22,
-    "sentiment": 0.18,
-    "market": 0.10,
-    "news": 0.05,
-}
-
 DISCLAIMER = (
-    "⚠️ 本预测仅为基于公开行情数据的量化参考，不构成任何投资建议。"
+    "⚠️ 以上数据仅为公开行情信息的客观汇总，不构成任何投资建议。"
     "股市有风险，入市需谨慎，据此操作盈亏自负。"
 )
-
-LLM_DISCLAIMER = "🤖 以上为 AI 生成的研判内容，仅供参考，不构成投资建议。"
 
 # 缓存 TTL（秒）
 CACHE_TTL = {
@@ -81,30 +59,20 @@ _cache_lock = threading.Lock()
 
 # 注：同花顺全市场资金流快照(stock_fund_flow_individual)内部需翻 100+ 页爬全市场
 # 5000+ 行，实测约 60s+，且会抢占网络拖慢其它请求，故不纳入自动降级路径。
-# 东财资金流失败时资金维度中性处理即可（见 get_fund_flow）。
-# 全市场类数据模块级缓存（北向 / 两融），避免 daily_report 逐只重复请求
+# 东财资金流失败时直接返回空，由 Agent 自行判断"资金数据缺失"。
+# 全市场类数据模块级缓存（北向/两融/涨停池/指数/解禁），避免批量场景逐只重复请求
 _margin_cache = {"data": None, "ts": 0}
 _north_cache = {"data": None, "ts": 0}
 _zt_cache = {"data": None, "ts": 0}
 _index_cache = {"data": None, "ts": 0}
+_unlock_cache = {"data": None, "ts": 0}
 _kline_cache = {"data": {}}  # code -> {"df": DataFrame, "ts": float}
 _intraday_cache = {"data": {}, "ts": {}}  # code -> snapshot dict, TTL 45s（仅盘中缓存）
-
-# 消息面情绪词库（精简版，可扩展）
-BULL_KEYWORDS = [
-    "增长", "大涨", "涨停", "突破", "创新高", "利好", "中标", "签约",
-    "回购", "增持", "预增", "扭亏", "超预期", "放量", "新高", "获准",
-    "获批", "战略合作", "订单", "提价", "涨价", "盈利", "分红", "送转",
-]
-BEAR_KEYWORDS = [
-    "下跌", "跌停", "破位", "利空", "减持", "质押", "亏损", "预减",
-    "预亏", "处罚", "违规", "立案", "调查", "退市", "警示", "下滑",
-    "计提", "商誉", "减持计划", "股东减持", "风险", "纠纷", "诉讼",
-]
+_news_cache = {"data": {}, "ts": {}}  # code -> DataFrame, TTL 5min
 
 
 # ---------------------------------------------------------------------------
-# 工具函数：缓存 / 重试
+# 工具函数：缓存 / 重试 / 归一化
 # ---------------------------------------------------------------------------
 def cached(key_type, key_extra=""):
     """带 TTL 的内存缓存装饰器。"""
@@ -198,7 +166,7 @@ def _safe_float(v, ndigits=None):
 
 
 # ---------------------------------------------------------------------------
-# 盘中实时数据层
+# 交易时段判定
 # ---------------------------------------------------------------------------
 def is_trading_session(now=None):
     """判断当前是否 A 股盘中，返回 (是否盘中, session_state)。
@@ -253,6 +221,9 @@ def _calc_trade_minutes(now=None):
     return min(240, minutes)
 
 
+# ---------------------------------------------------------------------------
+# 盘中实时数据层
+# ---------------------------------------------------------------------------
 def _intraday_unavailable(code, session_state, reason):
     """构造 available=False 的盘中快照。"""
     return {
@@ -281,15 +252,29 @@ def _intraday_unavailable(code, session_state, reason):
     }
 
 
-def _get_prev_close_and_volma5(code):
-    """从日K取昨收与 5 日均量。新浪日K不含当日（已验证），末行即昨收。"""
+def _get_prev_close_and_volma5(code, trade_date=None):
+    """从日K取昨收与 5 日均量。
+
+    注意：不同数据源行为不一致——新浪日K盘中通常不含当日，但东财日K盘中
+    可能已含当日（当日为未完成K线）。因此**不能假设末行即昨收**，必须按
+    trade_date 显式排除当日，否则 prev_close 会被取成现价，导致 chg_pct≈0。
+    """
     prev_close, vol_ma5 = None, None
     try:
         k = get_kline(code, 30)
         if k is not None and not k.empty:
-            prev_close = _safe_float(k["close"].iloc[-1])
-            if len(k) >= 5:
-                vol_ma5 = _safe_float(k["volume"].tail(5).mean())
+            kk = k.copy()
+            if "date" in kk.columns:
+                kk["_d"] = pd.to_datetime(kk["date"], errors="coerce").dt.date
+                if trade_date is not None:
+                    kk = kk[kk["_d"] < trade_date]
+                elif len(kk) >= 2:
+                    # 未指定交易日时，若末行日期 >= 今天，视为当日未完成K线并剔除
+                    kk = kk[kk["_d"] < dt.date.today()]
+            if not kk.empty:
+                prev_close = _safe_float(kk["close"].iloc[-1])
+                if len(kk) >= 5:
+                    vol_ma5 = _safe_float(kk["volume"].tail(5).mean())
     except Exception:  # noqa: BLE001
         pass
     return prev_close, vol_ma5
@@ -309,6 +294,8 @@ def _intraday_from_minute(code, df):
     cur = df[df["day"].dt.date == trade_date].copy()
     if cur.empty:
         return None
+    # 注意：新浪分时的 volume/amount 列是**字符串**，必须先转数值，
+    # 否则 sum() 会做字符串拼接，导致 VWAP / 盘中量比出现荒谬值（如量比 131）。
     for c in ("open", "high", "low", "close", "volume", "amount"):
         if c in cur.columns:
             cur[c] = pd.to_numeric(cur[c], errors="coerce")
@@ -316,7 +303,7 @@ def _intraday_from_minute(code, df):
     if cur.empty:
         return None
 
-    prev_close, vol_ma5 = _get_prev_close_and_volma5(code)
+    prev_close, vol_ma5 = _get_prev_close_and_volma5(code, trade_date)
     price = _safe_float(cur["close"].iloc[-1])
     openp = _safe_float(cur["open"].iloc[0])
     high = _safe_float(cur["high"].max())
@@ -555,41 +542,6 @@ def get_kline_json(symbol, days=120):
     return {"success": True, "symbol": code, "days": len(records), "kline": records}
 
 
-def watchlist(symbols, days=30):
-    """自选股批量行情快照（供前端自选股列表展示）。
-
-    对一组股票代码逐个调 quote，间隔 0.3s 控制频率避免触发数据源限流；
-    单只失败不中断整体，该项记 error 字段。
-    """
-    if isinstance(symbols, str):
-        symbols = [s.strip() for s in symbols.split(",") if s.strip()]
-    codes = []
-    for s in symbols or []:
-        s = str(s).strip()
-        if s.isdigit() and len(s) == 6:
-            codes.append(s)
-    quotes = []
-    for code in codes:
-        try:
-            q = quote(code)
-            if q and q.get("success"):
-                quotes.append({
-                    "symbol": q.get("symbol", code),
-                    "date": q.get("date", ""),
-                    "close": q.get("close"),
-                    "chg_pct": q.get("chg_pct"),
-                    "volume_ratio": q.get("volume_ratio"),
-                    "ma5": q.get("ma5"),
-                    "ma20": q.get("ma20"),
-                })
-            else:
-                quotes.append({"symbol": code, "error": (q or {}).get("error", "获取失败")})
-        except Exception as e:  # noqa: BLE001
-            quotes.append({"symbol": code, "error": str(e)[:100]})
-        time.sleep(0.3)
-    return {"success": True, "count": len(quotes), "quotes": quotes}
-
-
 def get_fund_flow(symbol, days=10):
     """主力资金流向。东财源(stock_individual_fund_flow)，失败返回空。
 
@@ -735,7 +687,7 @@ def get_unlock(symbol):
 
 
 # ---------------------------------------------------------------------------
-# 技术指标计算
+# 技术指标计算（纯数学，不含任何判断）
 # ---------------------------------------------------------------------------
 def _calc_indicators(df):
     """在日K基础上追加技术指标列。"""
@@ -747,6 +699,8 @@ def _calc_indicators(df):
             out[c] = pd.to_numeric(out[c], errors="coerce")
     for n in (5, 10, 20, 60):
         out[f"ma{n}"] = out["close"].rolling(n).mean()
+    # 涨跌幅（百分数口径，相对前一交易日收盘）
+    out["chg_pct"] = (out["close"] / out["close"].shift(1) - 1) * 100
     # MACD
     ema12 = out["close"].ewm(span=12, adjust=False).mean()
     ema26 = out["close"].ewm(span=26, adjust=False).mean()
@@ -797,897 +751,297 @@ def _compute_atr(df, n=14):
 
 
 # ---------------------------------------------------------------------------
-# 五维打分
+# 数据汇总层：get_snapshot —— 一次取齐 Agent 分析所需的全部原始数据
 # ---------------------------------------------------------------------------
-def _score_tech(kline):
-    """量价技术面打分 [-100, 100]。"""
-    evidence = []
-    if kline is None or len(kline) < 20:
-        return {"score": 0, "evidence": ["技术面数据不足，中性处理"], "available": False}
-    ind = _calc_indicators(kline)
-    r = _last_row(ind)
-    px = float(r["close"])
-    score = 0.0
-
-    # 均线趋势
-    trend_pts = 0
-    if px > r["ma5"]: trend_pts += 1
-    if px > r["ma10"]: trend_pts += 1
-    if px > r["ma20"]: trend_pts += 1
-    if px > r["ma60"]: trend_pts += 1
-    if not pd.isna(r["ma5"]) and not pd.isna(r["ma20"]) and r["ma5"] > r["ma20"]:
-        trend_pts += 1
-    score += (trend_pts - 2.5) * 10  # 满分±25
-    ma_desc = "站上" if px > r["ma20"] else "跌破"
-    evidence.append(f"股价{ma_desc}20日线；5/10/20/60日均线多头项 {trend_pts}/5")
-
-    # MACD
-    if not pd.isna(r["dif"]) and not pd.isna(r["dea"]):
-        if r["dif"] > r["dea"] and r["dif"] > 0:
-            score += 12; evidence.append("MACD 金叉且位于零轴上方（多头强势）")
-        elif r["dif"] > r["dea"]:
-            score += 6; evidence.append("MACD 金叉（短多）")
-        elif r["dif"] < r["dea"] and r["dif"] < 0:
-            score -= 12; evidence.append("MACD 死叉且位于零轴下方（空头弱势）")
-        else:
-            score -= 6; evidence.append("MACD 死叉（短空）")
-
-    # RSI
-    if not pd.isna(r["rsi14"]):
-        rsi = float(r["rsi14"])
-        if rsi >= 80: score -= 8; evidence.append(f"RSI={rsi:.0f} 超买，警惕回调")
-        elif rsi >= 70: score += 4; evidence.append(f"RSI={rsi:.0f} 偏强")
-        elif rsi <= 20: score += 8; evidence.append(f"RSI={rsi:.0f} 超卖，或有反弹")
-        elif rsi <= 30: score -= 4; evidence.append(f"RSI={rsi:.0f} 偏弱")
-        else: evidence.append(f"RSI={rsi:.0f} 中性")
-
-    # BOLL 位置
-    if not pd.isna(r["boll_up"]) and not pd.isna(r["boll_low"]):
-        if px > r["boll_up"]: score -= 6; evidence.append("突破布林上轨，短线过热")
-        elif px < r["boll_low"]: score += 6; evidence.append("跌破布林下轨，超卖")
-        else: evidence.append("布林带内运行")
-
-    # 量比
-    if not pd.isna(r["vol_ratio"]):
-        vr = float(r["vol_ratio"])
-        if vr >= 1.5: score += 5; evidence.append(f"量比={vr:.2f}，显著放量")
-        elif vr <= 0.7: score -= 3; evidence.append(f"量比={vr:.2f}，缩量")
-        else: evidence.append(f"量比={vr:.2f}，量能平稳")
-
-    # 换手率（中短线活跃度，百分数口径）
-    if not pd.isna(r.get("turnover")):
-        to = float(r["turnover"])
-        if to >= 10:
-            score += 4; evidence.append(f"当日换手率 {to:.1f}%，交投极度活跃（短线关注度高）")
-        elif to >= 5:
-            score += 2; evidence.append(f"当日换手率 {to:.1f}%，交投活跃")
-        elif to <= 0.5:
-            score -= 3; evidence.append(f"当日换手率 {to:.1f}%，交投清淡，注意流动性")
-        else:
-            evidence.append(f"当日换手率 {to:.1f}%，交投正常")
-
-    # 近期涨跌（5日动量）
-    if len(ind) >= 6:
-        mom5 = (px / ind["close"].iloc[-6] - 1) * 100
-        if mom5 > 8: score -= 5; evidence.append(f"5日累计涨幅 {mom5:.1f}%，短线涨幅已大")
-        elif mom5 < -8: score += 5; evidence.append(f"5日累计跌幅 {mom5:.1f}%，超跌")
-        else: evidence.append(f"5日动量 {mom5:+.1f}%")
-
-    return {"score": max(-100, min(100, score)), "evidence": evidence, "available": True}
-
-
-def _score_fund(fund_df, north_df, margin_df):
-    """资金结构面打分。"""
-    evidence = []
-    score = 0.0
-    available = False
-    if fund_df is not None and not fund_df.empty:
-        available = True
-        f = fund_df.copy()
-        from_ths = "_source" in f.columns and (f["_source"].fillna("") == "ths").any()
-        # 东财源：主力净流入-净占比
-        net_col = next((c for c in f.columns if "主力净流入-净占比" in c), None)
-        net_amt_col = next((c for c in f.columns if "主力净流入-净额" in c), None)
-        if from_ths:
-            # 同花顺源：净额为带单位字符串（如 "8887.50万" / "2.02亿"）
-            amt = f.iloc[0].get("主力净流入-净额") if net_amt_col else None
-            amt_val = _parse_money(amt)
-            if amt_val is not None:
-                if amt_val > 0:
-                    score += 8; evidence.append(f"当日主力资金净流入约 {amt_val/1e8:.2f} 亿元（同花顺口径）")
-                elif amt_val < 0:
-                    score -= 8; evidence.append(f"当日主力资金净流出约 {-amt_val/1e8:.2f} 亿元（同花顺口径）")
-                else:
-                    evidence.append("当日主力资金净额约 0（同花顺口径）")
-        elif net_col:
-            vals = pd.to_numeric(f[net_col], errors="coerce").dropna()
-            if len(vals):
-                last = float(vals.iloc[-1])
-                recent5 = float(vals.tail(5).sum())
-                score += max(-6, min(6, last / 5))
-                if recent5 > 0:
-                    score += 8; evidence.append(f"近5日主力净流入为正（累计 {recent5:.1f}）")
-                else:
-                    score -= 8; evidence.append(f"近5日主力净流入为负（累计 {recent5:.1f}）")
-                trend = "净流入" if last > 0 else "净流出"
-                evidence.append(f"最新交易日主力资金{trend}（净占比 {last:.2f}%）")
-        elif net_amt_col:
-            # 有净额列但无占比列：按净额口径（东财旧版）
-            vals = pd.to_numeric(f[net_amt_col], errors="coerce").dropna()
-            if len(vals):
-                last = float(vals.iloc[-1])
-                if last > 0: score += 6; evidence.append(f"最新交易日主力资金净流入（净额 {last:.0f}）")
-                else: score -= 6; evidence.append(f"最新交易日主力资金净流出（净额 {last:.0f}）")
-    if north_df is not None and not north_df.empty:
-        available = True
-        try:
-            n = north_df.copy()
-            col = next((c for c in n.columns if "成交净买额" in c), None)
-            if col is not None:
-                row = n[n["板块"].astype(str).str.contains("沪股通|深股通", na=False)]
-                row = row[row["资金方向"].astype(str).str.contains("北向", na=False)] if "资金方向" in row.columns else row
-                if not row.empty:
-                    # 成交净买额单位为亿元
-                    total = float(pd.to_numeric(row[col], errors="coerce").sum())
-                    if total > 0.01: score += 6; evidence.append(f"北向资金净买入 {total:.1f} 亿元")
-                    elif total < -0.01: score -= 6; evidence.append(f"北向资金净卖出 {-total:.1f} 亿元")
-                    else: evidence.append(f"北向资金当日基本持平（{total:.2f} 亿元）")
-        except Exception:  # noqa: BLE001
-            pass
-    if margin_df is not None and not margin_df.empty:
-        available = True
-        try:
-            m = margin_df.copy()
-            bal_col = next((c for c in m.columns if "融资融券余额" in c), None)
-            if bal_col:
-                vals = pd.to_numeric(m[bal_col], errors="coerce").dropna()
-                if len(vals) >= 2:
-                    delta = float(vals.iloc[-1] - vals.iloc[-2])
-                    if delta > 0: score += 3; evidence.append(f"两融余额回升（近1日 {delta/1e8:+.1f} 亿）")
-                    else: score -= 3; evidence.append(f"两融余额回落（近1日 {delta/1e8:+.1f} 亿）")
-        except Exception:  # noqa: BLE001
-            pass
-    if not available:
-        evidence.append("资金面数据获取失败，中性处理")
-    return {"score": max(-100, min(100, score)), "evidence": evidence, "available": available}
-
-
-def _score_sentiment(zt_df):
-    """情绪题材面打分：涨停家数反映市场赚钱效应。"""
-    evidence = []
-    if zt_df is None or zt_df.empty:
-        evidence.append("涨停池数据获取失败（可能非交易日或接口限流），中性处理")
-        return {"score": 0, "evidence": evidence, "available": False}
-    n = len(zt_df)
-    if n >= 100:
-        score = 10; evidence.append(f"今日涨停 {n} 家，市场情绪高涨（注意过热）")
-    elif n >= 60:
-        score = 12; evidence.append(f"今日涨停 {n} 家，赚钱效应良好")
-    elif n >= 30:
-        score = 4; evidence.append(f"今日涨停 {n} 家，情绪中性偏暖")
-    else:
-        score = -8; evidence.append(f"今日涨停 {n} 家，市场情绪偏冷")
-    try:
-        if "连板数" in zt_df.columns:
-            max_lb = pd.to_numeric(zt_df["连板数"], errors="coerce").max()
-            if pd.notna(max_lb) and max_lb >= 3:
-                score += 4; evidence.append(f"最高连板 {int(max_lb)} 板，题材有高度")
-    except Exception:  # noqa: BLE001
-        pass
-    return {"score": max(-100, min(100, score)), "evidence": evidence, "available": True}
-
-
-def _score_market(index_df):
-    """大盘环境打分：指数趋势 + 量能。"""
-    evidence = []
-    if index_df is None or len(index_df) < 20:
-        evidence.append("大盘数据不足，中性处理")
-        return {"score": 0, "evidence": evidence, "available": False}
-    ind = _calc_indicators(index_df)
-    r = _last_row(ind)
-    px = float(r["close"])
-    score = 0.0
-    if not pd.isna(r["ma20"]):
-        if px > r["ma20"]:
-            score += 10; evidence.append(f"上证指数站上20日线（{px:.0f} > MA20 {r['ma20']:.0f}）")
-        else:
-            score -= 10; evidence.append(f"上证指数跌破20日线（{px:.0f} < MA20 {r['ma20']:.0f}）")
-    if not pd.isna(r.get("vol_ratio", np.nan)):
-        vr = float(r["vol_ratio"])
-        if vr > 1.3: score += 3; evidence.append("大盘放量")
-        elif vr < 0.8: score -= 3; evidence.append("大盘缩量")
-    if len(ind) >= 6:
-        mom = (px / ind["close"].iloc[-6] - 1) * 100
-        evidence.append(f"大盘5日动量 {mom:+.1f}%")
-    return {"score": max(-100, min(100, score)), "evidence": evidence, "available": True}
-
-
-def _score_news(news_df):
-    """消息事件面打分：关键词情绪统计。"""
-    evidence = []
-    if news_df is None or news_df.empty:
-        evidence.append("近期无相关新闻，消息面中性")
-        return {"score": 0, "evidence": evidence, "available": False}
-    text = ""
-    for col in ("新闻标题", "新闻内容", "新闻摘要"):
-        if col in news_df.columns:
-            text += " ".join(news_df[col].astype(str).tolist())
-    bull = sum(text.count(k) for k in BULL_KEYWORDS)
-    bear = sum(text.count(k) for k in BEAR_KEYWORDS)
-    score = float(np.clip((bull - bear) * 2, -15, 15))
-    if score > 5:
-        evidence.append(f"近期新闻偏利好（利好词 {bull} 次 / 利空词 {bear} 次）")
-    elif score < -5:
-        evidence.append(f"近期新闻偏利空（利好词 {bull} 次 / 利空词 {bear} 次）")
-    else:
-        evidence.append(f"近期新闻情绪中性（利好词 {bull} 次 / 利空词 {bear} 次）")
-    if "新闻标题" in news_df.columns:
-        titles = news_df["新闻标题"].head(3).astype(str).tolist()
-        for t in titles:
-            evidence.append(f"新闻：{t[:40]}")
-    return {"score": max(-100, min(100, score)), "evidence": evidence, "available": True}
-
-
-def _score_intraday(snap):
-    """盘中走势打分 [-100, 100]。
-
-    分值设计原则：越能反映资金真实态度的指标权重越高（VWAP 反映全天平均
-    成本，最难操纵），越短期的指标权重越低（30 分钟动量噪声大）。
-    理论范围约 ±43，有意窄于 _score_tech 的 ±100——盘中数据只反映当日
-    几小时，信息量不足以支撑极端判断。
-    字段为 None 时跳过该项（不计分），可用项 < 2 则 available=False。
-    """
-    evidence = []
-    if not snap or not snap.get("available"):
-        return {"score": 0, "evidence": ["盘中数据不可用，中性处理"], "available": False}
-
-    score = 0.0
-    used = 0
-
-    # 1) 相对 VWAP（±12）
-    v = snap.get("chg_vs_vwap")
-    if v is not None:
-        used += 1
-        if v >= 3:
-            score += 12; evidence.append(f"现价 {snap.get('price')} 显著站上全天均价 {snap.get('vwap')}（{v:+.2f}%），买方成本占优")
-        elif v >= 1:
-            score += 7; evidence.append(f"现价站上全天均价（{v:+.2f}%），偏强")
-        elif v > -1:
-            evidence.append(f"现价围绕全天均价震荡（{v:+.2f}%），中性")
-        elif v > -3:
-            score -= 7; evidence.append(f"现价跌破全天均价（{v:+.2f}%），偏弱")
-        else:
-            score -= 12; evidence.append(f"现价显著跌破全天均价（{v:+.2f}%），卖方压制")
-
-    # 2) 日内位置（±8）
-    p = snap.get("pos_in_range")
-    if p is not None:
-        used += 1
-        if p >= 85:
-            score += 8; evidence.append(f"日内位置 {p:.0f}%，处于日内高位，尾盘强势")
-        elif p >= 65:
-            score += 4; evidence.append(f"日内位置 {p:.0f}%，处于中上部")
-        elif p > 35:
-            evidence.append(f"日内位置 {p:.0f}%，处于中位")
-        elif p > 15:
-            score -= 4; evidence.append(f"日内位置 {p:.0f}%，处于中下部")
-        else:
-            score -= 8; evidence.append(f"日内位置 {p:.0f}%，贴近日内低点，弱势")
-
-    # 3) 相对开盘（±6）
-    o = snap.get("chg_vs_open")
-    if o is not None:
-        used += 1
-        if o >= 3:
-            score += 6; evidence.append(f"低开高走/高开续涨，相对开盘 {o:+.2f}%，日内多头主导")
-        elif o >= 1:
-            score += 3; evidence.append(f"相对开盘 {o:+.2f}%，日内偏强")
-        elif o > -1:
-            evidence.append(f"相对开盘 {o:+.2f}%，日内基本持平")
-        elif o > -3:
-            score -= 3; evidence.append(f"相对开盘 {o:+.2f}%，日内偏弱")
-        else:
-            score -= 6; evidence.append(f"高开低走，相对开盘 {o:+.2f}%，日内空头主导")
-
-    # 4) 盘中量比（±8），需结合涨跌方向
-    vr = snap.get("vol_ratio_intraday")
-    chg = snap.get("chg_pct")
-    if vr is not None and chg is not None:
-        used += 1
-        if vr >= 2.0:
-            if chg > 0:
-                score += 8; evidence.append(f"盘中量比 {vr:.2f} 放量上涨，资金主动做多")
+def _df_to_records(df, limit=None, date_col=None):
+    """DataFrame -> list[dict]，日期列统一转字符串，NaN 转 None，便于 JSON 序列化。"""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    d = df.copy()
+    if limit:
+        d = d.tail(limit)
+    out = []
+    for _, row in d.iterrows():
+        item = {}
+        for k, v in row.items():
+            key = str(k)
+            if isinstance(v, (pd.Timestamp, dt.datetime, dt.date)):
+                item[key] = str(v)[:19]
+            elif v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+                item[key] = None
+            elif isinstance(v, (np.integer,)):
+                item[key] = int(v)
+            elif isinstance(v, (np.floating,)):
+                fv = float(v)
+                item[key] = None if (math.isnan(fv) or math.isinf(fv)) else round(fv, 4)
+            elif isinstance(v, (np.bool_,)):
+                item[key] = bool(v)
             else:
-                score -= 8; evidence.append(f"盘中量比 {vr:.2f} 放量下跌，资金出逃")
-        elif vr >= 1.5:
-            if chg > 0:
-                score += 5; evidence.append(f"盘中量比 {vr:.2f} 温和放量上涨")
-            else:
-                score -= 5; evidence.append(f"盘中量比 {vr:.2f} 温和放量下跌")
-        elif vr <= 0.6:
-            if chg > 0:
-                score -= 3; evidence.append(f"盘中量比 {vr:.2f} 缩量上涨，上攻动能不足")
-            else:
-                score += 2; evidence.append(f"盘中量比 {vr:.2f} 缩量下跌，抛压不重")
-        else:
-            evidence.append(f"盘中量比 {vr:.2f}，量能平稳")
-
-    # 5) 30 分钟动量（±5）
-    m = snap.get("mom30")
-    if m is not None:
-        used += 1
-        if m >= 2:
-            score += 5; evidence.append(f"近30分钟 {m:+.2f}%，短线强势拉升")
-        elif m >= 0.8:
-            score += 2; evidence.append(f"近30分钟 {m:+.2f}%，短线偏强")
-        elif m > -0.8:
-            evidence.append(f"近30分钟 {m:+.2f}%，短线平稳")
-        elif m > -2:
-            score -= 2; evidence.append(f"近30分钟 {m:+.2f}%，短线偏弱")
-        else:
-            score -= 5; evidence.append(f"近30分钟 {m:+.2f}%，短线快速跳水")
-
-    # 6) 振幅异常惩罚（-2 ~ -4）
-    amp = snap.get("amplitude")
-    if amp is not None:
-        if amp >= 8:
-            score -= 4; evidence.append(f"日内振幅 {amp:.1f}%，波动剧烈，风险偏高")
-        elif amp >= 5:
-            score -= 2; evidence.append(f"日内振幅 {amp:.1f}%，波动较大")
-
-    if used < 2:
-        return {"score": 0, "evidence": evidence + ["盘中可用指标不足 2 项，中性处理"], "available": False}
-
-    if snap.get("partial"):
-        evidence.append("（部分盘中字段缺失，仅按可用项打分）")
-
-    return {"score": max(-100, min(100, score)), "evidence": evidence, "available": True}
-
-
-# ---------------------------------------------------------------------------
-# LLM 研判层
-# ---------------------------------------------------------------------------
-LLM_SYSTEM_PROMPT = """你是一名严谨的 A 股量化分析师，负责在已有量化规则结论的基础上，做综合研判。
-
-## 你的角色定位
-你不是预测机器，而是"证据审查员"。你的价值在于：
-1. 识别规则结论与数据之间是否存在矛盾
-2. 发现规则未覆盖的异常信号组合（如放量滞涨、缩量上涨、逆势走强）
-3. 结合新闻标题做语义理解（规则只能做关键词计数，你能读懂实际含义）
-4. 指出规则结论的薄弱环节与风险点
-
-## 硬性约束（违反即视为无效输出）
-1. **禁止计算任何数字**。所有数值（涨跌幅、得分、区间、均线、量比等）已由规则系统算好并提供给你。你只能引用，绝不能自己计算、推算或估算。
-2. **禁止编造数据**。不得引入输入中未提供的信息（如"公司近期获得大单"、"机构调研频繁"等）。如果输入中没有相关信息，就不要提及。
-3. **必须引用具体数据**。每条判断都要指明依据的是哪个字段的哪个数值，例如"相对均价 +1.95%"、"量比 0.82"。
-4. **不确定就说不确定**。如果数据不足以支撑判断，明确说明"数据不足，无法判断XX"，不要强行给出结论。
-5. **禁止给出投资建议**。不出现"建议买入"、"可以加仓"、"应当止损"等表述。只做客观分析。
-
-## 输入数据说明
-用户消息是一个 JSON，包含：
-- rule_scores: 规则系统各维度得分（每项含 score 与 evidence）
-- rule_total / rule_direction / rule_range / rule_confidence: 规则系统的综合结论
-- indicators: 关键技术指标（收盘价、均线、RSI、MACD、量比、换手率、ATR）
-- intraday: 盘中实时快照（若非盘中则为 null），含最新价、涨跌幅、相对均价、日内位置、盘中量比、30分钟动量
-- news_titles: 近期新闻标题列表
-- signals: 规则触发的信号列表
-
-## 输出要求
-只输出一个 JSON 对象，不要有任何其他文字、不要用 markdown 代码块包裹。格式：
-
-{
-  "direction": "看涨" | "看跌" | "震荡",
-  "confidence": 0-100 的整数,
-  "reasoning": "150-300 字的研判理由，必须引用具体数值",
-  "risk_flags": ["风险点1", "风险点2"]
-}
-
-字段说明：
-- direction: 你的独立研判方向。可以与规则结论一致，也可以不一致——如果数据确实指向相反方向，请如实给出并说明理由。
-- confidence: 你对自身研判的置信度。数据充分且信号一致时给高分（70-85），信号矛盾或数据缺失时给低分（30-50）。不要给 90 以上。
-- reasoning: 必须包含至少 3 处具体数值引用。说明你同意或不同意规则结论的理由。
-- risk_flags: 0-3 条风险提示，每条不超过 30 字。若无明显风险，返回空数组。"""
-
-
-def _parse_llm_json(content):
-    """容错解析 LLM 返回的 JSON（三级：直接解析 / 剥离代码块 / 正则提取）。"""
-    import json as _json
-    import re as _re
-    if not content or not isinstance(content, str):
-        return None
-    text = content.strip()
-    # 1) 直接解析
-    try:
-        return _json.loads(text)
-    except Exception:  # noqa: BLE001
-        pass
-    # 2) 剥离 ```json ... ``` 代码块
-    m = _re.search(r"```(?:json)?\s*(.*?)```", text, _re.S)
-    if m:
-        try:
-            return _json.loads(m.group(1).strip())
-        except Exception:  # noqa: BLE001
-            pass
-    # 3) 提取第一个 { 到最后一个 }
-    i, j = text.find("{"), text.rfind("}")
-    if i != -1 and j > i:
-        try:
-            return _json.loads(text[i:j + 1])
-        except Exception:  # noqa: BLE001
-            pass
-    return None
-
-
-def _build_llm_context(code, trade_date, is_intraday, session_state, dims, total,
-                       direction, range_low, range_high, confidence, indicators,
-                       intraday, news_titles, signals):
-    """构造 LLM 研判输入 context。"""
-    return {
-        "symbol": code,
-        "trade_date": trade_date,
-        "is_intraday": is_intraday,
-        "session_state": session_state,
-        "rule_scores": dims,
-        "rule_total": total,
-        "rule_direction": direction,
-        "rule_range": [range_low, range_high],
-        "rule_confidence": confidence,
-        "indicators": indicators,
-        "intraday": intraday,
-        "news_titles": news_titles,
-        "signals": signals,
-    }
-
-
-def _llm_judge(context, timeout=60, model_group="normal"):
-    """调用 LLM 做综合研判（带超时保护，失败静默降级）。
-
-    返回 {available, error, direction, confidence, reasoning, risk_flags,
-          model_group, elapsed, raw(可选)}
-    """
-    import json as _json
-    result = {
-        "available": False, "error": None, "direction": None,
-        "confidence": None, "reasoning": None, "risk_flags": [],
-        "model_group": model_group, "elapsed": 0.0,
-    }
-    t0 = time.time()
-    try:
-        from jarvis.jarvis_tools.model_chat import ModelChatTool
-    except Exception as e:  # noqa: BLE001
-        result["error"] = f"无法导入 model_chat: {e}"
-        return result
-
-    message = _json.dumps(context, ensure_ascii=False, indent=2)
-    box = {}
-
-    def _run():
-        try:
-            box["resp"] = ModelChatTool().execute(
-                message=message,
-                system_prompt=LLM_SYSTEM_PROMPT,
-                model_group=model_group,
-            )
-        except Exception as e:  # noqa: BLE001
-            box["exc"] = e
-
-    th = threading.Thread(target=_run, daemon=True)
-    th.start()
-    th.join(timeout)
-    result["elapsed"] = round(time.time() - t0, 2)
-
-    if th.is_alive():
-        result["error"] = f"LLM 调用超时（>{timeout}s）"
-        return result
-    if "exc" in box:
-        result["error"] = f"LLM 调用异常: {box['exc']}"
-        return result
-
-    resp = box.get("resp") or {}
-    if not resp.get("success"):
-        result["error"] = f"LLM 调用失败: {resp.get('error', '未知错误')}"
-        return result
-
-    content = resp.get("content") or ""
-    if not content.strip():
-        result["error"] = "LLM 返回空结果"
-        return result
-
-    data = _parse_llm_json(content)
-    if not isinstance(data, dict):
-        result["error"] = "LLM 输出格式无法解析"
-        result["raw"] = content[:500]
-        return result
-
-    # 字段校验
-    d = data.get("direction")
-    if d not in ("看涨", "看跌", "震荡"):
-        result["error"] = f"LLM 输出 direction 非法: {d!r}"
-        result["raw"] = content[:500]
-        return result
-    reasoning = data.get("reasoning")
-    if not isinstance(reasoning, str) or not reasoning.strip():
-        result["error"] = "LLM 输出缺少 reasoning"
-        result["raw"] = content[:500]
-        return result
-
-    conf = data.get("confidence")
-    try:
-        conf = int(conf)
-        conf = max(0, min(100, conf))
-    except (TypeError, ValueError):
-        conf = None
-
-    flags = data.get("risk_flags")
-    if not isinstance(flags, list):
-        flags = []
-    flags = [str(x)[:60] for x in flags][:3]
-
-    result.update({
-        "available": True,
-        "direction": d,
-        "confidence": conf,
-        "reasoning": reasoning.strip(),
-        "risk_flags": flags,
-    })
-    return result
-
-
-def _event_signals(symbol, kline):
-    """事件类触发信号：解禁临近等。"""
-    signals = []
-    try:
-        unlock = get_unlock(symbol)
-        if unlock is not None and not unlock.empty:
-            for _, row in unlock.iterrows():
-                date = str(row.get("解禁时间", ""))[:10]
-                val = row.get("实际解禁市值")
-                try:
-                    val_str = f"，解禁市值约 {float(val)/1e8:.1f} 亿" if pd.notna(val) else ""
-                except Exception:  # noqa: BLE001
-                    val_str = ""
-                signals.append(f"⚠️ 事件：{date} 限售解禁{val_str}，短线留意抛压")
-    except Exception:  # noqa: BLE001
-        pass
-    return signals
-
-
-def _tech_signals(kline):
-    """量价类触发信号。"""
-    signals = []
-    if kline is None or len(kline) < 25:
-        return signals
-    ind = _calc_indicators(kline)
-    r = _last_row(ind)
-    px = float(r["close"])
-    if not pd.isna(r["vol_ratio"]) and not pd.isna(r["ma20"]):
-        if r["vol_ratio"] >= 1.5 and px > r["ma20"] and len(ind) >= 2 and ind["close"].iloc[-2] <= r["ma20"]:
-            signals.append("🔔 放量上穿20日线，若明日放量站稳则短线偏强")
-    if not pd.isna(r["vol_ratio"]) and not pd.isna(r["ma5"]):
-        if r["vol_ratio"] <= 0.8 and abs(px - r["ma5"]) / r["ma5"] < 0.01:
-            signals.append("📈 缩量回踩5日线，回踩确认后有望再攻")
-    if not pd.isna(r["vol_ratio"]):
-        if r["vol_ratio"] >= 1.8 and len(ind) >= 3 and ind["close"].iloc[-2] > ind["close"].iloc[-3] and px <= ind["close"].iloc[-2]:
-            signals.append("🚨 放量滞涨（量增价不涨），警惕冲高回落")
-    if len(ind) >= 6:
-        up5 = all(not pd.isna(ind["close"].iloc[i]) and ind["close"].iloc[i] > ind["close"].iloc[i - 1]
-                  for i in range(-4, 0))
-        if up5 and px > r["ma20"]:
-            signals.append("⚠️ 连续5日上涨且处20日线上方，短线累计涨幅大，注意高开分歧")
-    if not pd.isna(r["dif"]) and not pd.isna(r["dea"]) and len(ind) >= 3:
-        if not pd.isna(ind["dif"].iloc[-2]) and not pd.isna(ind["dea"].iloc[-2]):
-            if ind["dif"].iloc[-2] < ind["dea"].iloc[-2] and r["dif"] > r["dea"]:
-                signals.append("📶 MACD 刚刚金叉，短线动能转强")
-    return signals
-
-
-# ---------------------------------------------------------------------------
-# 综合预测入口
-# ---------------------------------------------------------------------------
-def predict(symbol, days=120, mode="rule"):
-    """综合五维信号预测走势（盘中时自动注入盘中维度）。
-
-    mode:
-      "rule"   纯规则（默认，非盘中时与 v0.1.3 行为完全一致）
-      "llm"    规则 + LLM 研判（前端以 LLM 为主展示）
-      "hybrid" 规则 + LLM 研判（两者并列，冲突告警）
-    """
-    code = norm_symbol(symbol)
-    kline = get_kline(code, days)
-    if kline is None or kline.empty:
-        return {"success": False, "error": f"无法获取股票 {code} 的行情数据（数据源均不可用或代码无效）"}
-    # 并行抓取各维数据（串行但带降级，数据不足不影响整体）
-    fund = get_fund_flow(code, 10)
-    index = get_index_kline("sh000001", 60)
-    zt = get_zt_pool()
-    news = get_news(code, 10)
-    north = get_north_flow()
-    margin = get_margin()
-    tech = _score_tech(kline)
-    fnd = _score_fund(fund, north, margin)
-    sent = _score_sentiment(zt)
-    mkt = _score_market(index)
-    nws = _score_news(news)
-
-    # 盘中快照（非盘中时 get_intraday 直接返回 available=False，无网络开销）
-    snap = get_intraday(code)
-    is_intraday = bool(snap.get("available"))
-    intra = _score_intraday(snap) if is_intraday else {"score": 0, "evidence": [], "available": False}
-
-    # 加权综合（盘中用盘中权重表，非盘中用原权重表）
-    if is_intraday and intra["available"]:
-        w = WEIGHTS_INTRADAY
-        total = (
-            tech["score"] * w["tech"]
-            + intra["score"] * w["intraday"]
-            + fnd["score"] * w["fund"]
-            + sent["score"] * w["sentiment"]
-            + mkt["score"] * w["market"]
-            + nws["score"] * w["news"]
-        )
-    else:
-        w = WEIGHTS
-        total = (
-            tech["score"] * WEIGHTS["tech"]
-            + fnd["score"] * WEIGHTS["fund"]
-            + sent["score"] * WEIGHTS["sentiment"]
-            + mkt["score"] * WEIGHTS["market"]
-            + nws["score"] * WEIGHTS["news"]
-        )
-    total = max(-100, min(100, total))
-    # 方向判定
-    if total >= 15:
-        direction = "看涨"
-    elif total <= -15:
-        direction = "看跌"
-    else:
-        direction = "震荡"
-    # 涨跌幅区间：以 ATR 为基准，结合方向偏移
-    atr = _compute_atr(kline)
-    last_close = float(kline["close"].iloc[-1])
-    # 盘中时以现价为区间基准（预测"后续走势"相对当前价）
-    ref_price = float(snap["price"]) if (is_intraday and snap.get("price")) else last_close
-    atr_pct = atr / ref_price * 100 if ref_price else 1.5
-    # 盘中：预测周期是"剩余交易时间至收盘"，波动幅度需按剩余时间折算。
-    # 用 √(剩余分钟/240) 缩放（波动率随时间平方根增长，布朗运动假设）。
-    # 例：13:28 剩 92 分钟 → 缩放 √(92/240)=0.62，避免用全天 ATR 给出过宽区间。
-    if is_intraday:
-        remain = max(5, 240 - int(snap.get("trade_minutes") or 0))
-        atr_pct *= math.sqrt(remain / 240.0)
-    shift = total / 100 * atr_pct * 0.6  # 方向性偏移
-    low_pct = max(-10, min(10, shift - atr_pct * 0.5))
-    high_pct = max(-10, min(10, shift + atr_pct * 0.5))
-    low_pct, high_pct = min(low_pct, high_pct), max(low_pct, high_pct)
-    if abs(low_pct) < 0.05 and abs(high_pct) < 0.05:
-        low_pct, high_pct = -atr_pct * 0.3, atr_pct * 0.3
-    # 置信度：基于可用维度数量 + 总分强度
-    dim_list = [tech, fnd, sent, mkt, nws]
-    if is_intraday and intra["available"]:
-        dim_list.append(intra)
-    avail_dims = sum(1 for d in dim_list if d["available"])
-    conf = 40 + avail_dims * 5 + min(15, abs(total) / 100 * 15)
-    conf = min(85, conf)  # 预测不可能超过 85，留敬畏
-    # 触发信号
-    signals = _tech_signals(kline) + _event_signals(code, kline)
-    if is_intraday:
-        signals = _intraday_signals(snap) + signals
-        if not signals:
-            signals = ["⚪ 盘中暂无明显异动信号，走势平稳，建议持续观察"]
-    # 最近交易日与收盘
-    trade_date = str(kline["date"].iloc[-1])[:10]
-
-    # 各维度明细
-    dims = {
-        "tech": {"name": DIM_NAMES["tech"], "score": round(tech["score"], 1), "evidence": tech["evidence"], "weight": w["tech"]},
-        "fund": {"name": DIM_NAMES["fund"], "score": round(fnd["score"], 1), "evidence": fnd["evidence"], "weight": w["fund"]},
-        "sentiment": {"name": DIM_NAMES["sentiment"], "score": round(sent["score"], 1), "evidence": sent["evidence"], "weight": w["sentiment"]},
-        "market": {"name": DIM_NAMES["market"], "score": round(mkt["score"], 1), "evidence": mkt["evidence"], "weight": w["market"]},
-        "news": {"name": DIM_NAMES["news"], "score": round(nws["score"], 1), "evidence": nws["evidence"], "weight": w["news"]},
-    }
-    intraday_dim = None
-    if is_intraday and intra["available"]:
-        intraday_dim = {
-            "name": DIM_NAMES["intraday"],
-            "score": round(intra["score"], 1),
-            "evidence": intra["evidence"],
-            "weight": w["intraday"],
-        }
-        dims["intraday"] = intraday_dim
-
-    result = {
-        "success": True,
-        "symbol": code,
-        "trade_date": trade_date,
-        "last_close": round(last_close, 2),
-        "direction": direction,
-        "range_low": round(low_pct, 2),
-        "range_high": round(high_pct, 2),
-        "score": round(total, 1),
-        "confidence": round(conf),
-        "signals": signals,
-        "dims": dims,
-        "disclaimer": DISCLAIMER,
-        # 新增字段（非盘中为 None/False，向后兼容）
-        "mode": mode,
-        "is_intraday": is_intraday,
-        "session_state": snap.get("session_state"),
-        "ref_price": round(ref_price, 2),
-        "intraday": snap if is_intraday else None,
-        "intraday_dim": intraday_dim,
-        "llm": None,
-        "rule_result": None,
-        "conflict": False,
-    }
-
-    # LLM 研判（仅 mode != rule 时调用，失败静默降级）
-    if mode in ("llm", "hybrid"):
-        rule_result = {
-            "direction": direction,
-            "score": round(total, 1),
-            "confidence": round(conf),
-            "range_low": round(low_pct, 2),
-            "range_high": round(high_pct, 2),
-        }
-        result["rule_result"] = rule_result
-        ind = _calc_indicators(kline)
-        r = _last_row(ind)
-        indicators = {
-            "close": _safe_float(last_close, 2),
-            "ma5": _safe_float(r.get("ma5"), 2),
-            "ma20": _safe_float(r.get("ma20"), 2),
-            "ma60": _safe_float(r.get("ma60"), 2),
-            "rsi14": _safe_float(r.get("rsi14"), 1),
-            "macd_dif": _safe_float(r.get("dif"), 3),
-            "macd_dea": _safe_float(r.get("dea"), 3),
-            "vol_ratio": _safe_float(r.get("vol_ratio"), 2),
-            "turnover": _safe_float(r.get("turnover"), 2),
-            "atr": _safe_float(atr, 2),
-        }
-        news_titles = []
-        try:
-            if news is not None and not news.empty and "新闻标题" in news.columns:
-                news_titles = [str(x)[:60] for x in news["新闻标题"].head(10).tolist()]
-        except Exception:  # noqa: BLE001
-            pass
-        # 兜底：LLM 层任何异常都不得影响规则结果（硬约束：静默降级）
-        try:
-            ctx = _build_llm_context(
-                code, trade_date, is_intraday, snap.get("session_state"), dims, round(total, 1),
-                direction, round(low_pct, 2), round(high_pct, 2), round(conf), indicators,
-                snap if is_intraday else None, news_titles, signals,
-            )
-            llm = _llm_judge(ctx)
-        except Exception as e:  # noqa: BLE001
-            llm = {
-                "available": False, "error": f"LLM 研判异常: {e}", "direction": None,
-                "confidence": None, "reasoning": None, "risk_flags": [],
-                "model_group": "normal", "elapsed": 0.0,
-            }
-        if not isinstance(llm, dict):
-            llm = {
-                "available": False, "error": "LLM 研判返回格式异常", "direction": None,
-                "confidence": None, "reasoning": None, "risk_flags": [],
-                "model_group": "normal", "elapsed": 0.0,
-            }
-        llm["disclaimer"] = LLM_DISCLAIMER
-        result["llm"] = llm
-        # 冲突判定：仅当双方均为明确方向且相反
-        if llm.get("available"):
-            ld = llm.get("direction")
-            if direction != ld and direction != "震荡" and ld != "震荡":
-                result["conflict"] = True
-    return result
-
-
-def _intraday_signals(snap):
-    """盘中触发信号。"""
-    signals = []
-    if not snap or not snap.get("available"):
-        return signals
-    v = snap.get("chg_vs_vwap")
-    vr = snap.get("vol_ratio_intraday")
-    chg = snap.get("chg_pct")
-    if v is not None and v >= 2:
-        signals.append(f"🔴 盘中现价站上全天均价 {v:+.2f}%，日内多头占优")
-    elif v is not None and v <= -2:
-        signals.append(f"🟢 盘中现价跌破全天均价 {v:+.2f}%，日内空头占优")
-    if vr is not None and chg is not None:
-        if vr >= 2.0 and chg > 0:
-            signals.append(f"🚀 盘中放量上涨（量比 {vr:.2f}），资金主动做多")
-        elif vr >= 2.0 and chg < 0:
-            signals.append(f"🚨 盘中放量下跌（量比 {vr:.2f}），警惕资金出逃")
-        elif vr <= 0.6 and chg > 0:
-            signals.append(f"⚠️ 盘中缩量上涨（量比 {vr:.2f}），上攻动能不足")
-    return signals
-
-
-def quote(symbol):
-    """行情快照：最新价 + 当日涨跌 + 量比 + 换手 + 均线位置。"""
-    code = norm_symbol(symbol)
-    kline = get_kline(code, 30)
-    if kline is None or kline.empty:
-        return {"success": False, "error": f"无法获取 {code} 行情"}
-    ind = _calc_indicators(kline)
-    r = _last_row(ind)
-    last = float(r["close"])
-    prev = float(kline["close"].iloc[-2]) if len(kline) >= 2 else last
-    chg = (last / prev - 1) * 100 if prev else 0.0
-    out = {
-        "success": True,
-        "symbol": code,
-        "date": str(kline["date"].iloc[-1])[:10],
-        "close": round(last, 2),
-        "chg_pct": round(chg, 2),
-        "volume_ratio": round(float(r["vol_ratio"]), 2) if not pd.isna(r["vol_ratio"]) else None,
-        "ma5": round(float(r["ma5"]), 2) if not pd.isna(r["ma5"]) else None,
-        "ma10": round(float(r["ma10"]), 2) if not pd.isna(r["ma10"]) else None,
-        "ma20": round(float(r["ma20"]), 2) if not pd.isna(r["ma20"]) else None,
-        "ma60": round(float(r["ma60"]), 2) if not pd.isna(r["ma60"]) else None,
-        "rsi14": round(float(r["rsi14"]), 1) if not pd.isna(r["rsi14"]) else None,
-    }
+                item[key] = v
+        out.append(item)
     return out
 
 
-def analyze(symbol, dimension=None, days=120):
-    """单维度深度分析。dimension: tech/fund/sentiment/market/news，None 时全部分析。"""
+def _clean(obj):
+    """递归清洗：numpy 类型转原生、NaN/Inf 转 None。"""
+    if isinstance(obj, dict):
+        return {str(k): _clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean(v) for v in obj]
+    if isinstance(obj, (pd.Timestamp, dt.datetime, dt.date)):
+        return str(obj)[:19]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        f = float(obj)
+        return None if (math.isnan(f) or math.isinf(f)) else round(f, 4)
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else round(obj, 4)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, pd.DataFrame):
+        return _df_to_records(obj)
+    return obj
+
+
+def get_snapshot(symbol, days=120):
+    """
+    汇总单只股票的全部原始数据，供 Agent 做多维度分析。
+
+    返回结构（各字段失败时为 None / [] / {}，不抛异常）：
+    {
+      "symbol", "code", "name", "updated_at", "session_state", "is_intraday",
+      "disclaimer",
+      "intraday": {...} | None,        # 盘中实时快照（非盘中为 None）
+      "kline": [ {date,open,high,low,close,volume,turnover,...}, ... ],  # 最近 days 日
+      "indicators": {...},             # 最新一日技术指标（纯计算值）
+      "fund_flow": {...} | None,       # 个股主力资金流
+      "index": {...} | None,           # 大盘指数行情
+      "zt_pool": {...} | None,         # 涨停池统计
+      "news": [ {title,time,...} ],    # 近期新闻
+      "margin": {...} | None,          # 两融余额
+      "north_flow": {...} | None,      # 北向资金
+      "unlock": {...} | None,          # 解禁信息
+      "data_quality": {字段: "ok"/"empty"/"error"}   # 各数据源可用性，供 Agent 判断可信度
+    }
+    """
     code = norm_symbol(symbol)
-    kline = get_kline(code, days)
-    if kline is None or kline.empty:
-        return {"success": False, "error": f"无法获取 {code} 行情"}
+    quality = {}
+    now = dt.datetime.now()
+    is_intraday, session_state = is_trading_session(now)
 
-    data = {}
-    if dimension is None or dimension == "tech":
-        data["tech"] = _score_tech(kline)
-    if dimension is None or dimension == "fund":
-        fund = get_fund_flow(code, 10)
-        north = get_north_flow()
-        margin = get_margin()
-        data["fund"] = _score_fund(fund, north, margin)
-    if dimension is None or dimension == "sentiment":
-        zt = get_zt_pool()
-        data["sentiment"] = _score_sentiment(zt)
-    if dimension is None or dimension == "market":
-        index = get_index_kline("sh000001", 60)
-        data["market"] = _score_market(index)
-    if dimension is None or dimension == "news":
-        news = get_news(code, 10)
-        data["news"] = _score_news(news)
+    snap = {
+        "symbol": code,
+        "code": code,
+        "name": None,
+        "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "session_state": session_state,
+        "is_intraday": is_intraday,
+        "disclaimer": DISCLAIMER,
+    }
 
-    result = {"success": True, "symbol": code, "dimensions": {}}
-    for k, v in data.items():
-        result["dimensions"][k] = {
-            "name": DIM_NAMES.get(k, k),
-            "score": round(v["score"], 1),
-            "evidence": v["evidence"],
-        }
-    return result
-
-
-def daily_report(symbols, days=120):
-    """盘后日报：对一组股票生成预测，供定时任务调用。symbols 为代码列表。"""
-    if isinstance(symbols, str):
-        symbols = [s.strip() for s in symbols.split(",") if s.strip()]
-    reports = []
-    for code in symbols:
+    # 1) 日K + 技术指标
+    df = None
+    try:
+        df = get_kline(code, days=days)
+        quality["kline"] = "ok" if (df is not None and not df.empty) else "empty"
+    except Exception:
+        quality["kline"] = "error"
+    if df is not None and not df.empty:
         try:
-            r = predict(code, days)
-            reports.append(r)
-        except Exception as e:  # noqa: BLE001
-            reports.append({"success": False, "symbol": code, "error": str(e)[:100]})
-        time.sleep(0.5)  # 控制频率
-    return {"success": True, "count": len(reports), "reports": reports}
+            ind_df = _calc_indicators(df)
+            # kline 带上指标列，Agent 可自行判断形态（如 MA 多头排列、MACD 金叉位置）
+            snap["kline"] = _df_to_records(ind_df, limit=days)
+            last = _last_row(ind_df)
+            latest = {}
+            for k, v in last.items():
+                if isinstance(k, str):
+                    latest[k] = v
+            latest["atr14"] = _compute_atr(ind_df, 14)
+            snap["indicators"] = _clean(latest)
+            quality["indicators"] = "ok"
+        except Exception:
+            snap["kline"] = _df_to_records(df, limit=days)
+            snap["indicators"] = None
+            quality["indicators"] = "error"
+    else:
+        snap["kline"] = []
+        snap["indicators"] = None
+        quality.setdefault("indicators", "empty")
+
+    # 2) 盘中快照
+    try:
+        intra = get_intraday(code)
+        if intra and intra.get("available"):
+            snap["intraday"] = _clean(intra)
+            quality["intraday"] = "ok"
+        else:
+            snap["intraday"] = None
+            quality["intraday"] = "not_available"
+    except Exception:
+        snap["intraday"] = None
+        quality["intraday"] = "error"
+
+    # 3) 个股资金流（近10日主力/超大单/大单/中单/小单净流入）
+    time.sleep(0.4)  # 数据源间隔，降低东财限流概率
+    try:
+        ff = get_fund_flow(code)
+        snap["fund_flow"] = _df_to_records(ff, limit=10) if ff is not None and not ff.empty else None
+        quality["fund_flow"] = "ok" if snap["fund_flow"] else "empty"
+    except Exception:
+        snap["fund_flow"] = None
+        quality["fund_flow"] = "error"
+
+    # 4) 大盘指数（上证近60日，供 Agent 判断大盘环境）
+    time.sleep(0.4)
+    try:
+        idx = get_index_kline()
+        snap["index"] = _df_to_records(idx, limit=60) if idx is not None and not idx.empty else None
+        quality["index"] = "ok" if snap["index"] else "empty"
+    except Exception:
+        snap["index"] = None
+        quality["index"] = "error"
+
+    # 5) 涨停池（市场情绪面：涨停家数/连板高度/封板资金/所属行业）
+    time.sleep(0.4)
+    try:
+        zt = get_zt_pool()
+        zt_recs = _df_to_records(zt, limit=200) if zt is not None and not zt.empty else []
+        if zt_recs:
+            # 统计摘要 + 明细，Agent 无需自行聚合
+            industries = {}
+            for r in zt_recs:
+                ind = r.get("所属行业") or "未知"
+                industries[ind] = industries.get(ind, 0) + 1
+            boards = [r.get("连板数") for r in zt_recs if isinstance(r.get("连板数"), (int, float))]
+            snap["zt_pool"] = {
+                "count": len(zt_recs),
+                "max_board": max(boards) if boards else None,
+                "industry_rank": sorted(
+                    [{"industry": k, "count": v} for k, v in industries.items()],
+                    key=lambda x: -x["count"],
+                )[:10],
+                "list": zt_recs,
+            }
+            quality["zt_pool"] = "ok"
+        else:
+            snap["zt_pool"] = None
+            quality["zt_pool"] = "empty"
+    except Exception:
+        snap["zt_pool"] = None
+        quality["zt_pool"] = "error"
+
+    # 6) 新闻（消息面原始文本，交由 Agent 做语义理解）
+    try:
+        news = get_news(code)
+        snap["news"] = _df_to_records(news, limit=20) if news is not None else []
+        quality["news"] = "ok" if snap["news"] else "empty"
+    except Exception:
+        snap["news"] = []
+        quality["news"] = "error"
+
+    # 7) 两融（全市场口径，非个股）
+    try:
+        mg = get_margin()
+        snap["margin"] = _df_to_records(mg, limit=10) if mg is not None and not mg.empty else None
+        quality["margin"] = "ok" if snap["margin"] else "empty"
+    except Exception:
+        snap["margin"] = None
+        quality["margin"] = "error"
+
+    # 8) 北向资金
+    time.sleep(0.4)
+    try:
+        nf = get_north_flow()
+        snap["north_flow"] = _df_to_records(nf, limit=10) if nf is not None and not nf.empty else None
+        quality["north_flow"] = "ok" if snap["north_flow"] else "empty"
+    except Exception:
+        snap["north_flow"] = None
+        quality["north_flow"] = "error"
+
+    # 9) 解禁（未来60天，该股无解禁时为空列表）
+    time.sleep(0.4)
+    try:
+        ul = get_unlock(code)
+        snap["unlock"] = _df_to_records(ul, limit=20) if ul is not None and not ul.empty else []
+        quality["unlock"] = "ok" if snap["unlock"] else "none"
+    except Exception:
+        snap["unlock"] = []
+        quality["unlock"] = "error"
+    except Exception:
+        snap["unlock"] = None
+        quality["unlock"] = "error"
+
+    # 10) 股票名称（从新闻/资金流里取不到时留空，Agent 可用代码检索）
+    snap["data_quality"] = quality
+    return _clean(snap)
+
+
+def get_snapshot_json(symbol, days=120):
+    """get_snapshot 的纯 JSON 版本（供前端侧边栏 function-call 使用）。"""
+    return get_snapshot(symbol, days=days)
 
 
 # ---------------------------------------------------------------------------
-# gateway 前端代理白名单（仅这些函数可被调用）
+# 对外暴露函数白名单（gateway 前端可调用）
 # ---------------------------------------------------------------------------
 PUBLIC_FUNCTIONS = [
-    "predict",
-    "quote",
-    "analyze",
-    "daily_report",
+    "get_snapshot",
+    "get_snapshot_json",
     "get_kline",
     "get_kline_json",
-    "watchlist",
     "get_intraday",
+    "get_fund_flow",
+    "get_index_kline",
+    "get_zt_pool",
+    "get_news",
+    "get_margin",
+    "get_north_flow",
+    "get_unlock",
+    "watchlist",
 ]
+
+
+def watchlist(symbols):
+    """
+    批量获取自选股行情快照（前端自选股列表用）。
+    symbols: 代码列表或逗号分隔字符串。
+    返回 {"items": [ {symbol, name, price, chg_pct, session_state, ...} ], "errors": [...]}
+    """
+    if isinstance(symbols, str):
+        codes = [s.strip() for s in symbols.replace("，", ",").split(",") if s.strip()]
+    elif isinstance(symbols, (list, tuple)):
+        codes = [str(s).strip() for s in symbols if str(s).strip()]
+    else:
+        return {"items": [], "errors": [{"error": "symbols 参数格式不支持"}]}
+
+    items, errors = [], []
+    is_intraday, session_state = is_trading_session(dt.datetime.now())
+    for i, c in enumerate(codes):
+        if i > 0:
+            time.sleep(0.3)  # 防限流
+        try:
+            code = norm_symbol(c)
+            item = {"symbol": code, "session_state": session_state}
+            df = get_kline(code, days=30)
+            if df is not None and not df.empty:
+                last = df.iloc[-1]
+                item["last_close"] = _safe_float(last.get("close"))
+                item["date"] = str(last.get("date"))[:10]
+                prev = df.iloc[-2] if len(df) >= 2 else None
+                if prev is not None:
+                    pc = _safe_float(prev.get("close"))
+                    if pc and item["last_close"]:
+                        item["chg_pct"] = round((item["last_close"] / pc - 1) * 100, 2)
+            if is_intraday:
+                intra = get_intraday(code)
+                if intra and intra.get("available"):
+                    item["price"] = intra.get("price")
+                    item["chg_pct"] = intra.get("chg_pct")
+                    item["intraday"] = True
+            if "price" not in item:
+                item["price"] = item.get("last_close")
+            items.append(item)
+        except Exception as e:
+            errors.append({"symbol": c, "error": str(e)[:200]})
+    return {"items": items, "errors": errors, "session_state": session_state}

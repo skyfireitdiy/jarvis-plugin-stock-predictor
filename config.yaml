@@ -1,13 +1,13 @@
 ---
 id: stock-predictor
-name: A股中短线预测
+name: A股个股数据
 description: >-
-  综合量价技术面/资金结构面/情绪题材面/大盘环境/消息事件面五维信号，
-  预测 A 股次日方向、涨跌幅区间与触发信号，输出可解释的逐项证据与置信度。
-  盘中调用时自动注入盘中走势维度（实时价相对均价/开盘/日内位置/盘中量比/30分钟动量），
-  并可选启用 LLM 综合研判（规则 + AI 双轨对照，方向分歧时告警）。
-  支持对话问答与定时盘后日报（工具 stock_daily_report）。
-version: 0.1.4
+  为 Agent 提供 A 股个股的完整原始数据快照：日K与技术指标（MA/MACD/RSI/BOLL/ATR/量比/换手）、
+  盘中实时走势（现价/VWAP/日内位置/盘中量比/30分钟动量，仅交易时段提供）、
+  主力资金流、涨停池情绪、上证指数环境、两融余额、北向资金、解禁信息与个股新闻。
+  插件本身不做打分、不预测方向，分析结论由 Agent 基于这些数据自行给出。
+  支持对话问答、侧边栏数据面板（一键让 Agent 分析）与定时盘后日报。
+version: 0.2.0
 license: MIT
 logo: >-
   <svg viewBox="0 0 16 16" fill="none" stroke="#34d399" stroke-width="1.5"
@@ -20,7 +20,7 @@ logo: >-
 frontend:
   sidebar_views:
     - id: stock-predictor
-      title: "A股预测"
+      title: "A股数据"
       entry: sidebar_view.js
       icon: frontend/icon.svg
 tool_load_dirs:
@@ -33,13 +33,15 @@ dependencies:
     pandas: ">=1.5.0"
     numpy: ">=1.24.0"
 capabilities:
-  - name: "A股走势预测（含盘中实时）"
-    description: "输入股票代码，综合五维信号预测方向/涨跌幅/触发信号；盘中自动注入盘中走势维度"
-  - name: "盘中实时快照"
-    description: "获取实时价、相对均价、日内位置、盘中量比、30分钟动量等盘中指标"
-  - name: "LLM 综合研判"
-    description: "可选启用大模型对规则证据做二次审查，输出独立方向判断与风险提示，与规则结果双轨对照"
-  - name: "单维度深度分析"
-    description: "单独分析技术面/资金面/大盘/消息面任一维度"
-  - name: "盘后预测日报"
-    description: "对关注列表自动生成每日预测报告（可配定时任务）"
+  - name: "个股数据快照"
+    description: "一次获取单只股票的日K+技术指标、盘中走势、资金流、涨停池情绪、大盘环境、新闻、两融、解禁等九类原始数据"
+  - name: "盘中实时走势"
+    description: "交易时段提供实时价、VWAP、日内位置、盘中量比、30分钟动量、振幅；非交易时段自动跳过网络请求"
+  - name: "技术指标计算"
+    description: "计算 MA5/10/20/60、MACD、RSI14、BOLL、ATR14、量比、换手率等客观指标，不做任何方向判断"
+  - name: "单维度数据"
+    description: "按技术面/资金面/情绪面/大盘/消息面单独返回某一维度的原始数据"
+  - name: "批量数据摘要"
+    description: "对关注列表批量拉取数据摘要，供盘后复盘或定时任务使用（不调 LLM，零成本）"
+  - name: "侧边栏数据面板"
+    description: "可视化展示K线图、盘中快照、技术指标、资金流、新闻，一键把数据发给当前 Agent 分析"

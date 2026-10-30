@@ -1,15 +1,29 @@
-// stock-predictor 插件前端侧边栏视图。
+// stock-predictor 插件前端侧边栏视图（v0.2.0 纯数据面板）。
 // 约定：纯浏览器 ES module，用 window.Vue 渲染，导出 default 组件，不 import 'vue'。
-// 功能：A股中短线预测——搜索/自选股、次日方向+涨跌幅区间、五维得分、K线图、触发信号。
-// 认证：统一走 window.__jarvisFetch（宿主注入，自动携带 jarvis 认证信息，token 不暴露给插件）；
-//       后端通过 /api/plugins/{node_id}/function-call 代理调用插件 api.py PUBLIC_FUNCTIONS。
-// 图表：SVG 自绘（蜡烛图 + MA5/MA20 + 预测区间带 + 成交量），无第三方依赖。
+//
+// 设计原则：**前端只展示客观数据，不做任何预测判断。**
+// 所有分析结论由 Agent（大模型）在对话中给出——点击"让 Agent 分析"按钮
+// 会把当前股票的数据摘要发给当前活跃 Agent，由 Agent 做多维度研判。
+//
+// 注意：模板中引用的所有函数必须定义在 methods/computed 上（v0.1.2 空白 bug 教训）；
+//       根 div 必须 height:100% + overflow:auto + box-sizing:border-box（v0.1.3 滚动 bug 教训）。
 const PLUGIN = "stock-predictor";
+
 // 自选股列表持久化 key（按插件固定，浏览器本地存储）
 const WATCHLIST_KEY = "jarvis_stock_predictor_watchlist";
-// 兜底免责声明（后端 predict 正常返回时会带完整 disclaimer 覆盖）
+
+// 兜底免责声明（后端 get_snapshot 正常返回时会带 disclaimer 覆盖）
 const FALLBACK_DISCLAIMER =
-  "⚠️ 本预测仅为基于公开行情数据的量化参考，不构成任何投资建议。股市有风险，入市需谨慎，据此操作盈亏自负。";
+  "⚠️ 本面板仅展示公开行情数据的客观汇总，不构成任何投资建议。股市有风险，入市需谨慎，据此操作盈亏自负。";
+
+// 交易时段中文
+const SESSION_TXT = {
+  pre_open: "盘前",
+  trading: "盘中交易中",
+  lunch_break: "午间休市",
+  closed: "已收盘",
+  no_data: "无数据",
+};
 
 // 复刻 App.vue 的 gateway 地址解析（侧边栏组件无 props 注入，需自行解析）
 function parseGatewayAddress(address) {
@@ -82,24 +96,19 @@ async function callFunction(functionName, args, nodeId) {
   return result.result;
 }
 
-// 方向 → 徽章配色（A股习惯：红涨绿跌）
-// 注意：这些是模块顶层纯函数，仅供组件 methods 内调用；
-// 模板里通过实例方法 directionColor/directionBg/scoreColor 间接访问（见 methods）。
-function directionColorTop(dir) {
-  if (dir === "看涨") return "#ef4444";
-  if (dir === "看跌") return "#22c55e";
-  return "#888888";
+// A股配色：红涨绿跌。以下为模块顶层纯函数，仅供 methods 内调用；
+// 模板通过实例方法 chgColor/maColor 间接访问（见 methods）。
+function upColorTop(v) {
+  const n = Number(v);
+  if (Number.isNaN(n) || n === 0) return "#dddddd";
+  return n > 0 ? "#ef4444" : "#22c55e";
 }
-function directionBgTop(dir) {
-  if (dir === "看涨") return "rgba(239,68,68,0.15)";
-  if (dir === "看跌") return "rgba(34,197,94,0.15)";
-  return "rgba(136,136,136,0.15)";
-}
-// 得分色：>0 红（A股做多情绪）<0 绿，0 灰
-function scoreColorTop(s) {
-  if (s > 0) return "#ef4444";
-  if (s < 0) return "#22c55e";
-  return "#888888";
+// 均线位置色：价在均线上方红、下方绿
+function maColorTop(price, ma) {
+  const p = Number(price);
+  const m = Number(ma);
+  if (Number.isNaN(p) || Number.isNaN(m) || !m) return "#888888";
+  return p >= m ? "#ef4444" : "#22c55e";
 }
 
 export default {
@@ -107,75 +116,139 @@ export default {
   data() {
     return {
       searchInput: "",
-      // 自选股列表（localStorage 持久化）
       watchlist: [],
-      // 当前选中代码
       current: "",
       loading: false,
       error: "",
-      // predict 结果
-      pred: null,
-      // K线数组 [{date,open,close,high,low,volume,amount,turnover}]
-      kline: [],
-      // 展开的维度名（默认展开权重最大的技术面）
-      expandedDim: "",
-      // 自选行情缓存（watchlist 接口结果，key=symbol）
+      snap: null,
       quoteCache: {},
-      // 预测模式：rule=纯规则 / hybrid=规则+AI研判（默认 rule，不调 LLM）
-      mode: "rule",
+      showKline: true,
+      showFund: true,
+      showNews: true,
+      showMacro: false,
+      showZt: false,
+      sending: false,
     };
   },
   mounted() {
     this.loadWatchlist();
-    if (this.watchlist.length > 0) {
-      this.switchStock(this.watchlist[0]);
-    }
+    // 注意：mounted 里不自动加载自选股——否则用户每次打开侧边栏都会触发一次
+    // 约 10 秒的全量数据抓取（9 个数据源），既慢又浪费。由用户主动点击切换。
   },
   computed: {
-    // 兜底免责声明（模板可访问）
     fallbackDisclaimer() {
       return FALLBACK_DISCLAIMER;
     },
-    // 是否盘中实时预测
-    isIntraday() {
-      return !!(this.pred && this.pred.success && this.pred.is_intraday);
-    },
-    // 盘中时段文字
     sessionText() {
-      const s = this.pred && this.pred.session_state;
-      if (s === "trading") return "盘中交易中";
-      if (s === "lunch_break") return "午间休市";
-      return "盘中";
+      const s = this.snap && this.snap.session_state;
+      return SESSION_TXT[s] || s || "--";
     },
-    // 盘中快照
-    snap() {
-      return (this.pred && this.pred.intraday) || null;
+    isIntraday() {
+      return !!(this.snap && this.snap.is_intraday);
     },
-    // LLM 研判（仅 hybrid 模式且后端返回时存在）
-    llm() {
-      return (this.pred && this.pred.llm) || null;
+    intra() {
+      return (this.snap && this.snap.intraday) || null;
     },
-    // 按权重降序排列的维度列表
-    dimsList() {
-      if (!this.pred || !this.pred.dims) return [];
-      const list = Object.values(this.pred.dims || {}).filter(
-        (d) => d && d.name,
+    ind() {
+      return (this.snap && this.snap.indicators) || null;
+    },
+    kline() {
+      const k = (this.snap && this.snap.kline) || [];
+      return Array.isArray(k) ? k.slice(-60) : [];
+    },
+    fundFlow() {
+      const f = (this.snap && this.snap.fund_flow) || [];
+      return Array.isArray(f) ? f.slice(-10).reverse() : [];
+    },
+    zt() {
+      return (this.snap && this.snap.zt_pool) || null;
+    },
+    indexList() {
+      const i = (this.snap && this.snap.index) || [];
+      return Array.isArray(i) ? i : [];
+    },
+    indexSummary() {
+      const list = this.indexList;
+      if (list.length === 0) return null;
+      const last = list[list.length - 1];
+      const chg = (n) => {
+        if (list.length < n) return null;
+        const base = Number(list[list.length - n].close);
+        const cur = Number(last.close);
+        if (!base || !cur) return null;
+        return (cur / base - 1) * 100;
+      };
+      return {
+        date: String(last.date || "").slice(0, 10),
+        close: last.close,
+        d5: chg(5),
+        d10: chg(10),
+        d20: chg(20),
+        d60: chg(60),
+      };
+    },
+    newsList() {
+      const n = (this.snap && this.snap.news) || [];
+      return Array.isArray(n) ? n.slice(0, 10) : [];
+    },
+    margin() {
+      const m = (this.snap && this.snap.margin) || [];
+      return Array.isArray(m) && m.length > 0 ? m[m.length - 1] : null;
+    },
+    north() {
+      const n = (this.snap && this.snap.north_flow) || [];
+      return Array.isArray(n) ? n : [];
+    },
+    unlockList() {
+      const u = (this.snap && this.snap.unlock) || [];
+      return Array.isArray(u) ? u : [];
+    },
+    quality() {
+      return (this.snap && this.snap.data_quality) || {};
+    },
+    failedSources() {
+      return Object.keys(this.quality).filter(
+        (k) => this.quality[k] === "error",
       );
-      list.sort((a, b) => (b.weight || 0) - (a.weight || 0));
-      return list;
+    },
+    disclaimer() {
+      return (this.snap && this.snap.disclaimer) || FALLBACK_DISCLAIMER;
     },
   },
   methods: {
-    // 模板中使用的工具函数（模板只能访问组件实例上的方法/属性，
-    // 模块顶层函数不会暴露到实例，否则渲染时会 TypeError 导致组件空白）
-    directionColor(dir) {
-      return directionColorTop(dir);
+    // ---- 模板可访问的工具方法（模板只能访问实例方法，不能引用模块顶层函数）----
+    chgColor(v) {
+      return upColorTop(v);
     },
-    directionBg(dir) {
-      return directionBgTop(dir);
+    maColor(price, ma) {
+      return maColorTop(price, ma);
     },
-    scoreColor(s) {
-      return scoreColorTop(s);
+    fmt(v, nd) {
+      if (v === null || v === undefined || v === "") return "--";
+      const n = Number(v);
+      if (Number.isNaN(n)) return String(v);
+      return nd === undefined ? String(n) : n.toFixed(nd);
+    },
+    pct(v, nd) {
+      if (v === null || v === undefined) return "--";
+      const n = Number(v);
+      if (Number.isNaN(n)) return "--";
+      const d = nd === undefined ? 2 : nd;
+      return (n > 0 ? "+" : "") + n.toFixed(d) + "%";
+    },
+    money(v) {
+      if (v === null || v === undefined) return "--";
+      const n = Number(v);
+      if (Number.isNaN(n)) return "--";
+      const abs = Math.abs(n);
+      if (abs >= 1e8) return (n / 1e8).toFixed(2) + "亿";
+      if (abs >= 1e4) return (n / 1e4).toFixed(1) + "万";
+      return n.toFixed(0);
+    },
+    qIcon(v) {
+      if (v === "ok") return "✅";
+      if (v === "error") return "❌";
+      return "⚪";
     },
     // ---- 自选股管理 ----
     loadWatchlist() {
@@ -212,8 +285,7 @@ export default {
           this.switchStock(this.watchlist[0]);
         } else {
           this.current = "";
-          this.pred = null;
-          this.kline = [];
+          this.snap = null;
           this.error = "";
         }
       }
@@ -225,7 +297,6 @@ export default {
       this.searchInput = code;
       this.load(code);
     },
-    // ---- 搜索 ----
     doSearch() {
       const code = String(this.searchInput || "").trim();
       if (!/^\d{6}$/.test(code)) {
@@ -241,48 +312,29 @@ export default {
       if (!/^\d{6}$/.test(code)) return;
       this.loading = true;
       this.error = "";
-      this.pred = null;
-      this.kline = [];
-      // 并行拉取预测 + K线
-      const results = await Promise.allSettled([
-        callFunction("predict", { symbol: code, days: 120, mode: this.mode }),
-        callFunction("get_kline_json", { symbol: code, days: 60 }),
-      ]);
-      this.loading = false;
-      const p = results[0];
-      if (p.status === "fulfilled" && p.value && p.value.success) {
-        this.pred = p.value;
-        if (p.value.dims && !this.expandedDim) {
-          const top = Object.values(p.value.dims).sort(
-            (a, b) => (b.weight || 0) - (a.weight || 0),
-          )[0];
-          this.expandedDim = top ? top.name : "";
+      this.snap = null;
+      try {
+        const data = await callFunction("get_snapshot_json", {
+          symbol: code,
+          days: 120,
+        });
+        if (!data || typeof data !== "object") {
+          throw new Error("返回数据为空");
         }
+        this.snap = data;
         this.addToWatchlist(code);
-      } else {
-        const reason = p.status === "rejected" ? p.reason : p.value;
-        const msg = (reason && reason.message) || "预测获取失败";
+        this.refreshQuotes(true);
+      } catch (e) {
+        const msg = (e && e.message) || "数据获取失败";
         this.error = msg;
         this.toast(msg, "error");
+      } finally {
+        this.loading = false;
       }
-      const k = results[1];
-      if (k.status === "fulfilled" && k.value && k.value.success) {
-        this.kline = Array.isArray(k.value.kline) ? k.value.kline : [];
-      }
-      // 尝试刷新自选行情（限流友好）
-      this.refreshQuotes(true);
     },
     refresh() {
       if (this.current) this.load(this.current);
     },
-    // 切换预测模式（rule=纯规则快速；hybrid=规则+AI研判，较慢）
-    setMode(m) {
-      if (m !== "rule" && m !== "hybrid") return;
-      if (this.mode === m) return;
-      this.mode = m;
-      if (this.current) this.load(this.current);
-    },
-    // 批量拉自选行情（throttle：同一只 30s 内不重复拉，防后端限流）
     async refreshQuotes(silent) {
       if (this.watchlist.length === 0) return;
       const now = Date.now();
@@ -293,8 +345,8 @@ export default {
       if (need.length === 0) return;
       try {
         const res = await callFunction("watchlist", { symbols: need });
-        if (res && Array.isArray(res.quotes)) {
-          for (const q of res.quotes) {
+        if (res && Array.isArray(res.items)) {
+          for (const q of res.items) {
             if (q && q.symbol) {
               this.quoteCache[q.symbol] = Object.assign({}, q, { _ts: now });
             }
@@ -304,34 +356,112 @@ export default {
         if (!silent) this.toast((e && e.message) || "自选行情获取失败", "error");
       }
     },
-    // ---- 交互 ----
+    // ---- 让 Agent 分析 ----
     askAgent() {
-      if (!this.pred || !this.pred.success) {
-        this.toast("请先加载一只股票的预测", "warning");
+      if (!this.snap) {
+        this.toast("请先加载一只股票的数据", "warning");
         return;
       }
-      const p = this.pred;
-      const signals =
-        Array.isArray(p.signals) && p.signals.length > 0
-          ? "\n触发信号：" + p.signals.slice(0, 5).join("；")
-          : "";
-      const text =
-        `【A股预测】${p.symbol} ${p.trade_date} 收盘 ${p.last_close}\n` +
-        `方向：${p.direction}；预期区间：${p.range_low}% ~ ${p.range_high}%；` +
-        `综合得分 ${p.score}；置信度 ${p.confidence}%。` +
-        signals +
-        `\n请基于以上预测帮我做更深入的分析（参考技术面/资金面/消息面证据）。`;
+      const s = this.snap;
+      const ind = this.ind || {};
+      const intra = this.intra;
+      const lines = [];
+      lines.push(
+        "【A股数据】" + s.code + "  数据时间 " + s.updated_at + "  交易时段：" + this.sessionText,
+      );
+      if (intra) {
+        lines.push(
+          "盘中：现价 " + this.fmt(intra.price) +
+            "（昨收 " + this.fmt(intra.prev_close) + "，涨跌 " + this.pct(intra.chg_pct) + "），" +
+            "均价 " + this.fmt(intra.vwap, 3) +
+            "，日内位置 " + this.fmt(intra.pos_in_range, 1) + "%" +
+            "，盘中量比 " + this.fmt(intra.vol_ratio_intraday) +
+            "，30分钟动量 " + this.pct(intra.mom30) +
+            "，振幅 " + this.pct(intra.amplitude) +
+            "，已交易 " + this.fmt(intra.trade_minutes) + " 分钟",
+        );
+      } else {
+        lines.push("当前非盘中（" + this.sessionText + "），无实时快照。");
+      }
+      if (ind && ind.date) {
+        lines.push(
+          "技术指标（" + ind.date + "）：收盘 " + this.fmt(ind.close) +
+            "，MA5 " + this.fmt(ind.ma5) + " / MA10 " + this.fmt(ind.ma10) +
+            " / MA20 " + this.fmt(ind.ma20) + " / MA60 " + this.fmt(ind.ma60) +
+            "，MACD DIF " + this.fmt(ind.dif, 4) + " DEA " + this.fmt(ind.dea, 4) +
+            " 柱 " + this.fmt(ind.macd, 4) +
+            "，RSI14 " + this.fmt(ind.rsi14) +
+            "，BOLL 上 " + this.fmt(ind.boll_up) + " / 中 " + this.fmt(ind.boll_mid) +
+            " / 下 " + this.fmt(ind.boll_low) +
+            "，量比 " + this.fmt(ind.vol_ratio) +
+            "，换手 " + this.pct(ind.turnover) +
+            "，ATR14 " + this.fmt(ind.atr14),
+        );
+      }
+      const ff = this.fundFlow.slice(0, 5);
+      if (ff.length > 0) {
+        lines.push(
+          "主力资金（近5日）：" +
+            ff
+              .map(
+                (r) =>
+                  String(r["日期"] || "").slice(5, 10) +
+                  " " +
+                  this.money(r["主力净流入-净额"]),
+              )
+              .join("；"),
+        );
+      }
+      if (this.zt) {
+        lines.push(
+          "市场情绪：涨停 " + this.fmt(this.zt.count) + " 家，最高 " +
+            this.fmt(this.zt.max_board) + " 连板",
+        );
+      }
+      if (this.indexSummary) {
+        const ix = this.indexSummary;
+        lines.push(
+          "大盘（上证 " + ix.date + " 收 " + this.fmt(ix.close) + "）：" +
+            "近5日 " + this.pct(ix.d5) + "，近20日 " + this.pct(ix.d20) +
+            "，近60日 " + this.pct(ix.d60),
+        );
+      }
+      if (this.newsList.length > 0) {
+        lines.push("近期新闻：");
+        this.newsList.slice(0, 6).forEach((n, i) => {
+          lines.push(
+            "  " + (i + 1) + ". [" + String(n["发布时间"] || "").slice(0, 16) +
+              "] " + (n["新闻标题"] || ""),
+          );
+        });
+      }
+      if (this.failedSources.length > 0) {
+        lines.push(
+          "注意：以下数据源本次获取失败，分析时请说明：" + this.failedSources.join("、"),
+        );
+      }
+      lines.push("");
+      lines.push(
+        "请基于以上数据，从技术面、资金面、情绪面、大盘环境、消息面多维度分析，" +
+          "给出你的判断（方向倾向、关键依据、主要风险）。" +
+          (intra ? "注意：当前为盘中，请结合盘中走势分析。" : "当前为收盘后数据。"),
+      );
+
+      const text = lines.join("\n");
       const send =
         typeof window !== "undefined" && window.__jarvisSendToActiveAgent;
-      if (typeof send === "function") {
-        try {
-          send(text, { silent: true });
-          this.toast("已发送给当前 Agent，请在对话中查看", "success");
-        } catch (e) {
-          this.toast("发送失败：" + ((e && e.message) || "未知错误"), "error");
-        }
-      } else {
+      if (typeof send !== "function") {
         this.toast("当前环境不支持发送给 Agent", "warning");
+        return;
+      }
+      this.sending = true;
+      try {
+        send(text, { silent: true });
+        this.toast("已发送给当前 Agent，请在对话中查看分析", "success");
+      } catch (e) {
+        this.toast("发送失败：" + ((e && e.message) || "未知错误"), "error");
+      } finally {
+        this.sending = false;
       }
     },
     toast(message, type) {
@@ -346,12 +476,11 @@ export default {
       }
       if (type === "error") this.error = message;
     },
-    // ---- SVG K线图 ----
+    // ---- SVG K线图（蜡烛 + MA5/MA20 + 成交量）----
     klineSvg() {
       const data = this.kline;
       if (!Array.isArray(data) || data.length === 0) return "";
       const n = data.length;
-      // 尺寸
       const W = 560;
       const H = 300;
       const plotLeft = 10;
@@ -364,9 +493,7 @@ export default {
       const plotH = plotBottom - plotTop;
       const slotW = plotW / n;
       const candleW = Math.max(1, slotW * 0.6);
-      // 收盘价数组（用于 MA）
       const closes = data.map((d) => Number(d.close));
-      // MA 计算
       const ma = (arr, period) => {
         const out = [];
         for (let i = 0; i < arr.length; i++) {
@@ -389,7 +516,6 @@ export default {
       };
       const ma5 = ma(closes, 5);
       const ma20 = ma(closes, 20);
-      // 价格范围（纳入预测区间）
       let minP = Infinity;
       let maxP = -Infinity;
       for (const d of data) {
@@ -398,35 +524,17 @@ export default {
         if (!Number.isNaN(lo)) minP = Math.min(minP, lo);
         if (!Number.isNaN(hi)) maxP = Math.max(maxP, hi);
       }
-      let predLowP = null;
-      let predHighP = null;
-      const lastClose = closes[n - 1];
-      if (
-        this.pred &&
-        this.pred.success &&
-        lastClose !== null &&
-        lastClose !== undefined &&
-        !Number.isNaN(lastClose)
-      ) {
-        predLowP = lastClose * (1 + Number(this.pred.range_low || 0) / 100);
-        predHighP = lastClose * (1 + Number(this.pred.range_high || 0) / 100);
-        minP = Math.min(minP, predLowP);
-        maxP = Math.max(maxP, predHighP);
-      }
-      if (!isFinite(minP) || !isFinite(maxP) || minP === maxP) {
-        if (!isFinite(minP) || !isFinite(maxP)) {
-          minP = 0;
-          maxP = 1;
-        } else if (minP === maxP) {
-          maxP = minP + 1;
-        }
+      if (!isFinite(minP) || !isFinite(maxP)) {
+        minP = 0;
+        maxP = 1;
+      } else if (minP === maxP) {
+        maxP = minP + 1;
       }
       const pad = (maxP - minP) * 0.06;
       minP -= pad;
       maxP += pad;
       const y = (p) => plotTop + ((maxP - p) / (maxP - minP)) * plotH;
       const x = (i) => plotLeft + i * slotW + slotW / 2;
-      // 成交量范围
       let maxVol = 0;
       for (const d of data) {
         const v = Number(d.volume);
@@ -435,28 +543,16 @@ export default {
       maxVol = maxVol || 1;
       const volH = (v) => ((v || 0) / maxVol) * (volBottom - volTop);
 
-      let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" xmlns="http://www.w3.org/2000/svg" style="display:block;font-family:system-ui,sans-serif;">`;
-      svg += `<rect x="0" y="0" width="${W}" height="${H}" fill="#1a1a1a" rx="6"/>`;
+      let svg = '<svg viewBox="0 0 ' + W + " " + H + '" width="100%" xmlns="http://www.w3.org/2000/svg" style="display:block;font-family:system-ui,sans-serif;">';
+      svg += '<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="#1a1a1a" rx="6"/>';
 
-      // 网格线
       for (let g = 0; g <= 4; g++) {
         const gy = plotTop + (plotH / 4) * g;
-        svg += `<line x1="${plotLeft}" y1="${gy}" x2="${plotRight}" y2="${gy}" stroke="#2a2a2a" stroke-width="1"/>`;
+        svg += '<line x1="' + plotLeft + '" y1="' + gy + '" x2="' + plotRight + '" y2="' + gy + '" stroke="#2a2a2a" stroke-width="1"/>';
         const price = maxP - ((maxP - minP) / 4) * g;
-        svg += `<text x="${plotLeft + 2}" y="${gy - 3}" fill="#666" font-size="9">${price.toFixed(2)}</text>`;
+        svg += '<text x="' + (plotLeft + 2) + '" y="' + (gy - 3) + '" fill="#666" font-size="9">' + price.toFixed(2) + "</text>";
       }
 
-      // 预测区间带（最后一根K线之后）
-      if (predLowP !== null && predHighP !== null) {
-        const fx0 = x(n - 1) + candleW / 2;
-        const fx1 = plotRight;
-        const fy0 = y(predHighP);
-        const fy1 = y(predLowP);
-        svg += `<rect x="${fx0}" y="${Math.min(fy0, fy1)}" width="${fx1 - fx0}" height="${Math.abs(fy1 - fy0)}" fill="rgba(245,158,11,0.12)" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,3"/>`;
-        svg += `<text x="${fx0 + 4}" y="${Math.min(fy0, fy1) - 4}" fill="#f59e0b" font-size="9">预测 ${this.pred.range_low}% ~ ${this.pred.range_high}%</text>`;
-      }
-
-      // MA 折线
       const linePath = (arr, color) => {
         let d = "";
         for (let i = 0; i < arr.length; i++) {
@@ -465,17 +561,16 @@ export default {
           const px = x(i);
           const py = y(arr[i]);
           d += d
-            ? ` L${px.toFixed(2)},${py.toFixed(2)}`
-            : `M${px.toFixed(2)},${py.toFixed(2)}`;
+            ? " L" + px.toFixed(2) + "," + py.toFixed(2)
+            : "M" + px.toFixed(2) + "," + py.toFixed(2);
         }
         return d
-          ? `<path d="${d}" fill="none" stroke="${color}" stroke-width="1.4" opacity="0.9"/>`
+          ? '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.4" opacity="0.9"/>'
           : "";
       };
       svg += linePath(ma20, "#3b82f6");
       svg += linePath(ma5, "#f59e0b");
 
-      // 蜡烛 + 成交量
       for (let i = 0; i < n; i++) {
         const d = data[i];
         const o = Number(d.open);
@@ -490,41 +585,30 @@ export default {
         const yo = y(o);
         const yhi = y(hi);
         const ylo = y(lo);
-        // 影线
-        svg += `<line x1="${cx}" y1="${yhi}" x2="${cx}" y2="${ylo}" stroke="${col}" stroke-width="1"/>`;
-        // 实体
+        svg += '<line x1="' + cx + '" y1="' + yhi + '" x2="' + cx + '" y2="' + ylo + '" stroke="' + col + '" stroke-width="1"/>';
         const top = Math.min(yc, yo);
         const bodyH = Math.max(1, Math.abs(yc - yo));
-        svg += `<rect x="${(cx - candleW / 2).toFixed(2)}" y="${top.toFixed(2)}" width="${candleW.toFixed(2)}" height="${bodyH.toFixed(2)}" fill="${up ? col : "none"}" stroke="${col}" stroke-width="1"/>`;
-        // 成交量
+        svg += '<rect x="' + (cx - candleW / 2).toFixed(2) + '" y="' + top.toFixed(2) + '" width="' + candleW.toFixed(2) + '" height="' + bodyH.toFixed(2) + '" fill="' + (up ? col : "none") + '" stroke="' + col + '" stroke-width="1"/>';
         const v = Number(d.volume);
         if (!Number.isNaN(v)) {
           const vh = volH(v);
-          svg += `<rect x="${(cx - candleW / 2).toFixed(2)}" y="${(volBottom - vh).toFixed(2)}" width="${candleW.toFixed(2)}" height="${vh.toFixed(2)}" fill="${col}" opacity="0.55"/>`;
+          svg += '<rect x="' + (cx - candleW / 2).toFixed(2) + '" y="' + (volBottom - vh).toFixed(2) + '" width="' + candleW.toFixed(2) + '" height="' + vh.toFixed(2) + '" fill="' + col + '" opacity="0.55"/>';
         }
       }
 
-      // 日期刻度（首/中/尾）
       const idxs = [0, Math.floor(n / 2), n - 1];
       for (const i of idxs) {
         const label = String(data[i].date || "").slice(5, 10) || String(i);
-        svg += `<text x="${x(i)}" y="${volBottom + 12}" fill="#666" font-size="9" text-anchor="middle">${label}</text>`;
+        svg += '<text x="' + x(i) + '" y="' + (volBottom + 12) + '" fill="#666" font-size="9" text-anchor="middle">' + label + "</text>";
       }
-      // 图例
-      svg += `<text x="${plotLeft + 2}" y="${plotTop + 10}" fill="#f59e0b" font-size="9">MA5</text>`;
-      svg += `<text x="${plotLeft + 32}" y="${plotTop + 10}" fill="#3b82f6" font-size="9">MA20</text>`;
-      svg += `</svg>`;
+      svg += '<text x="' + (plotLeft + 2) + '" y="' + (plotTop + 10) + '" fill="#f59e0b" font-size="9">MA5</text>';
+      svg += '<text x="' + (plotLeft + 32) + '" y="' + (plotTop + 10) + '" fill="#3b82f6" font-size="9">MA20</text>';
+      svg += "</svg>";
       return svg;
-    },
-    // 维度条宽度（-100~100 → 半条百分比）
-    dimBarWidth(score) {
-      const s = Number(score);
-      if (Number.isNaN(s)) return 0;
-      return Math.min(50, (Math.abs(s) / 100) * 50);
     },
   },
   template: `
-  <div style="display:flex;flex-direction:column;gap:10px;padding:10px;font-size:13px;color:#ddd;background:transparent;height:100%;overflow:auto;box-sizing:border-box;">
+  <div style="display:flex;flex-direction:column;gap:10px;padding:10px;font-size:13px;color:#ddd;height:100%;overflow:auto;box-sizing:border-box;">
     <!-- 搜索框 -->
     <div style="display:flex;gap:6px;">
       <input v-model="searchInput" placeholder="输入 6 位股票代码" @keydown.enter.prevent="doSearch"
@@ -537,25 +621,26 @@ export default {
     </div>
 
     <!-- 自选股 -->
-    <div v-if="watchlist.length > 0"
-      style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+    <div v-if="watchlist.length > 0" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
       <span style="font-size:11px;color:#888;">自选:</span>
       <span v-for="c in watchlist" :key="c" @click="switchStock(c)"
         style="display:inline-flex;align-items:center;gap:4px;padding:2px 6px;background:#252526;border:1px solid #3c3c3c;border-radius:10px;cursor:pointer;font-size:11px;color:#ddd;"
         :style="c === current ? 'border-color:#1f6feb;color:#58a6ff;' : ''">
-        {{ c }}
-        <span @click.stop="removeFromWatchlist(c)" style="color:#888;font-size:10px;cursor:pointer;"
-          title="删除">✕</span>
+        <span :style="{ color: quoteCache[c] ? chgColor(quoteCache[c].chg_pct) : '#ddd' }">{{ c }}</span>
+        <span v-if="quoteCache[c] && quoteCache[c].price != null" style="font-size:10px;opacity:0.85;">{{ fmt(quoteCache[c].price) }}</span>
+        <span v-if="quoteCache[c] && quoteCache[c].chg_pct != null" style="font-size:10px;"
+          :style="{ color: chgColor(quoteCache[c].chg_pct) }">{{ pct(quoteCache[c].chg_pct) }}</span>
+        <span @click.stop="removeFromWatchlist(c)" style="color:#888;font-size:10px;cursor:pointer;" title="删除">✕</span>
       </span>
     </div>
 
     <!-- 加载中 -->
     <div v-if="loading" style="padding:20px;text-align:center;color:#888;font-size:12px;">
-      正在获取行情与预测数据…
+      正在获取行情数据（多数据源，约 10 秒）…
     </div>
 
     <!-- 错误 -->
-    <div v-else-if="error && !pred"
+    <div v-else-if="error && !snap"
       style="padding:14px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.4);border-radius:6px;color:#f87171;font-size:12px;">
       {{ error }}
     </div>
@@ -567,205 +652,269 @@ export default {
       <span style="font-size:11px;color:#555;">支持沪深 A股（6 位代码，如 600519 / 000001）</span>
     </div>
 
-    <!-- 预测主卡片 -->
-    <div v-else-if="pred && pred.success"
-      style="background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:10px;">
-      <!-- 头部：代码 + 日期 + 刷新 -->
-      <div style="display:flex;align-items:center;gap:8px;">
-        <span style="font-weight:600;font-size:15px;color:#eee;">{{ pred.symbol }}</span>
-        <span style="font-size:11px;color:#888;">{{ pred.trade_date }} 收盘 {{ pred.last_close }}</span>
+    <!-- 数据面板 -->
+    <template v-else-if="snap">
+      <!-- 头部 -->
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span style="font-weight:600;font-size:15px;color:#eee;">{{ snap.code }}</span>
+        <span v-if="snap.name" style="font-size:13px;color:#ccc;">{{ snap.name }}</span>
+        <span style="padding:1px 8px;border-radius:10px;font-size:10px;"
+          :style="isIntraday
+            ? 'background:rgba(34,197,94,0.15);color:#4ade80;border:1px solid rgba(34,197,94,0.4);'
+            : 'background:rgba(136,136,136,0.15);color:#aaa;border:1px solid rgba(136,136,136,0.35);'">
+          {{ isIntraday ? '● ' : '' }}{{ sessionText }}
+        </span>
         <span style="flex:1;"></span>
         <button @click="refresh" title="刷新"
           style="padding:3px 8px;background:#252526;color:#aaa;border:1px solid #3c3c3c;border-radius:4px;cursor:pointer;font-size:11px;">⟳</button>
       </div>
 
-      <!-- 模式切换：纯规则 / 规则+AI -->
-      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-        <span style="font-size:11px;color:#888;">模式</span>
-        <button @click="setMode('rule')" :disabled="loading"
-          style="padding:3px 10px;border-radius:10px;cursor:pointer;font-size:11px;"
-          :style="mode === 'rule'
-            ? 'background:rgba(31,111,235,0.2);color:#58a6ff;border:1px solid #1f6feb;'
-            : 'background:#252526;color:#888;border:1px solid #3c3c3c;'">纯规则</button>
-        <button @click="setMode('hybrid')" :disabled="loading"
-          style="padding:3px 10px;border-radius:10px;cursor:pointer;font-size:11px;"
-          :style="mode === 'hybrid'
-            ? 'background:rgba(168,85,247,0.2);color:#c084fc;border:1px solid #a855f7;'
-            : 'background:#252526;color:#888;border:1px solid #3c3c3c;'">规则 + AI 研判</button>
-        <span style="flex:1;"></span>
-        <span v-if="isIntraday"
-          style="padding:2px 8px;border-radius:10px;font-size:10px;background:rgba(34,197,94,0.15);color:#4ade80;border:1px solid rgba(34,197,94,0.4);">
-          ● {{ sessionText }}
-        </span>
-      </div>
-
-      <!-- 盘中实时行情 -->
-      <div v-if="isIntraday && snap"
+      <!-- 盘中实时快照（仅盘中显示） -->
+      <div v-if="isIntraday && intra"
         style="display:flex;flex-wrap:wrap;gap:10px;padding:8px 10px;background:#161b22;border:1px solid #2a3a4a;border-radius:6px;">
         <div style="display:flex;flex-direction:column;gap:2px;">
           <span style="font-size:10px;color:#888;">现价</span>
-          <span style="font-size:15px;font-weight:600;"
-            :style="{ color: Number(snap.chg_pct) > 0 ? '#ef4444' : (Number(snap.chg_pct) < 0 ? '#22c55e' : '#ddd') }">
-            {{ snap.price }}
-          </span>
+          <span style="font-size:15px;font-weight:600;" :style="{ color: chgColor(intra.chg_pct) }">{{ fmt(intra.price) }}</span>
         </div>
         <div style="display:flex;flex-direction:column;gap:2px;">
           <span style="font-size:10px;color:#888;">涨跌</span>
-          <span style="font-size:13px;font-weight:600;"
-            :style="{ color: Number(snap.chg_pct) > 0 ? '#ef4444' : (Number(snap.chg_pct) < 0 ? '#22c55e' : '#ddd') }">
-            {{ Number(snap.chg_pct) > 0 ? '+' : '' }}{{ snap.chg_pct }}%
-          </span>
+          <span style="font-size:13px;font-weight:600;" :style="{ color: chgColor(intra.chg_pct) }">{{ pct(intra.chg_pct) }}</span>
         </div>
         <div style="display:flex;flex-direction:column;gap:2px;">
-          <span style="font-size:10px;color:#888;">相对均价</span>
-          <span style="font-size:13px;color:#ddd;">{{ snap.chg_vs_vwap == null ? '--' : (Number(snap.chg_vs_vwap) > 0 ? '+' : '') + snap.chg_vs_vwap + '%' }}</span>
+          <span style="font-size:10px;color:#888;">均价VWAP</span>
+          <span style="font-size:13px;color:#ddd;">{{ fmt(intra.vwap, 3) }}</span>
         </div>
         <div style="display:flex;flex-direction:column;gap:2px;">
           <span style="font-size:10px;color:#888;">日内位置</span>
-          <span style="font-size:13px;color:#ddd;">{{ snap.pos_in_range == null ? '--' : snap.pos_in_range + '%' }}</span>
+          <span style="font-size:13px;color:#ddd;">{{ fmt(intra.pos_in_range, 1) }}%</span>
         </div>
         <div style="display:flex;flex-direction:column;gap:2px;">
           <span style="font-size:10px;color:#888;">盘中量比</span>
-          <span style="font-size:13px;color:#ddd;">{{ snap.vol_ratio_intraday == null ? '--' : snap.vol_ratio_intraday }}</span>
+          <span style="font-size:13px;color:#ddd;">{{ fmt(intra.vol_ratio_intraday) }}</span>
         </div>
         <div style="display:flex;flex-direction:column;gap:2px;">
-          <span style="font-size:10px;color:#888;">30分钟动量</span>
-          <span style="font-size:13px;color:#ddd;">{{ snap.mom30 == null ? '--' : (Number(snap.mom30) > 0 ? '+' : '') + snap.mom30 + '%' }}</span>
+          <span style="font-size:10px;color:#888;">30分动量</span>
+          <span style="font-size:13px;" :style="{ color: chgColor(intra.mom30) }">{{ pct(intra.mom30) }}</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:2px;">
+          <span style="font-size:10px;color:#888;">振幅</span>
+          <span style="font-size:13px;color:#ddd;">{{ pct(intra.amplitude) }}</span>
         </div>
         <div style="width:100%;font-size:10px;color:#666;">
-          数据截至 {{ snap.updated_at || '--' }} · 来源 {{ snap.source || '--' }}
-          <span v-if="snap.partial" style="color:#f59e0b;">（降级数据，部分指标不可用）</span>
+          数据截至 {{ intra.updated_at || snap.updated_at }} · 来源 {{ intra.source || '--' }}
+          <span v-if="intra.partial" style="color:#f59e0b;">（降级数据）</span>
         </div>
       </div>
-      <!-- 方向徽章 + 关键指标 -->
-      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-        <span
-          style="padding:6px 14px;border-radius:16px;font-size:15px;font-weight:600;"
-          :style="{ background: directionBg(pred.direction), color: directionColor(pred.direction), border: '1px solid ' + directionColor(pred.direction) }">
-          {{ pred.direction }}
-        </span>
-        <div style="display:flex;flex-direction:column;gap:2px;">
-          <span style="font-size:11px;color:#888;">预期区间</span>
-          <span style="font-size:15px;font-weight:600;color:#eee;">{{ pred.range_low }}% ~ {{ pred.range_high }}%</span>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:2px;">
-          <span style="font-size:11px;color:#888;">综合得分</span>
-          <span style="font-size:15px;font-weight:600;" :style="{ color: scoreColor(pred.score) }">{{ pred.score }}</span>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:2px;">
-          <span style="font-size:11px;color:#888;">置信度</span>
-          <span style="font-size:15px;font-weight:600;color:#eee;">{{ pred.confidence }}%</span>
-        </div>
-      </div>
-
-      <!-- K线图 -->
-      <div v-if="kline.length > 0" style="border:1px solid #2a2a2a;border-radius:6px;overflow:hidden;"
-        v-html="klineSvg()"></div>
-      <div v-else style="padding:8px;text-align:center;color:#666;font-size:11px;">K线数据不可用</div>
-
-      <!-- 操作按钮 -->
-      <div style="display:flex;gap:8px;">
-        <button @click="askAgent"
-          style="flex:1;padding:7px 0;background:#1f6feb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">
-          问 Agent 深度分析
-        </button>
-      </div>
-    </div>
-
-    <!-- 五维得分 -->
-    <div v-if="pred && pred.success"
-      style="background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:8px;">
-      <div style="font-size:12px;color:#aaa;font-weight:600;">五维信号（点击展开证据）</div>
-      <div v-for="(d, i) in dimsList" :key="i" style="display:flex;flex-direction:column;gap:3px;">
-        <div style="display:flex;align-items:center;gap:6px;cursor:pointer;"
-          @click="expandedDim = expandedDim === d.name ? '' : d.name">
-          <span style="width:68px;font-size:12px;color:#ddd;">{{ d.name }}</span>
-          <span style="font-size:10px;color:#888;">{{ Math.round((d.weight || 0) * 100) }}%</span>
-          <div style="flex:1;position:relative;height:14px;background:#2a2a2a;border-radius:3px;overflow:hidden;">
-            <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#444;"></div>
-            <div v-if="Number(d.score) !== 0"
-              :style="{
-                position: 'absolute',
-                top: '2px', bottom: '2px', borderRadius: '2px',
-                background: scoreColor(d.score),
-                left: Number(d.score) > 0 ? '50%' : (50 - dimBarWidth(d.score)) + '%',
-                width: dimBarWidth(d.score) + '%',
-              }"></div>
-          </div>
-          <span style="font-size:12px;font-weight:600;width:44px;text-align:right;"
-            :style="{ color: scoreColor(d.score) }">{{ d.score }}</span>
-        </div>
-        <div v-if="expandedDim === d.name && d.evidence && d.evidence.length > 0"
-          style="margin-left:2px;padding-left:8px;border-left:2px solid #333;">
-          <div v-for="(ev, j) in d.evidence" :key="j"
-            style="font-size:11px;color:#aaa;line-height:1.5;padding:1px 0;">
-            · {{ ev }}
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- 触发信号 -->
-    <div v-if="pred && pred.success && pred.signals && pred.signals.length > 0"
-      style="background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:6px;">
-      <div style="font-size:12px;color:#aaa;font-weight:600;">触发信号</div>
-      <div v-for="(s, i) in pred.signals" :key="i"
-        style="font-size:12px;color:#fbbf24;line-height:1.5;">
-        {{ s }}
-      </div>
-    </div>
-
-    <!-- AI 研判（规则 + AI 双轨对照） -->
-    <div v-if="pred && pred.success && llm"
-      style="background:#1e1e1e;border:1px solid #4c1d95;border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:8px;">
-      <div style="display:flex;align-items:center;gap:8px;">
-        <span style="font-size:12px;color:#c084fc;font-weight:600;">🤖 AI 研判</span>
-        <span v-if="llm.available"
-          style="padding:1px 8px;border-radius:10px;font-size:10px;background:rgba(168,85,247,0.15);color:#c084fc;border:1px solid rgba(168,85,247,0.4);">
-          {{ llm.model_group || 'normal' }} · {{ llm.elapsed }}s
-        </span>
-      </div>
-      <template v-if="llm.available">
-        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-          <span style="padding:4px 12px;border-radius:14px;font-size:13px;font-weight:600;"
-            :style="{ background: directionBg(llm.direction), color: directionColor(llm.direction), border: '1px solid ' + directionColor(llm.direction) }">
-            {{ llm.direction }}
-          </span>
-          <span style="font-size:11px;color:#888;">AI 置信度 <span style="color:#ddd;font-weight:600;">{{ llm.confidence }}%</span></span>
-        </div>
-        <div v-if="pred.conflict"
-          style="padding:6px 8px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.4);border-radius:4px;color:#f59e0b;font-size:11px;line-height:1.5;">
-          ⚠️ 规则结论（{{ pred.rule_result ? pred.rule_result.direction : '--' }}）与 AI 研判方向分歧，请谨慎参考，勿单边操作。
-        </div>
-        <div v-else-if="pred.rule_result"
-          style="font-size:11px;color:#888;">
-          规则结论：{{ pred.rule_result.direction }}（得分 {{ pred.rule_result.score }}，置信度 {{ pred.rule_result.confidence }}%）· 与 AI 方向一致
-        </div>
-        <div style="font-size:12px;color:#ccc;line-height:1.6;white-space:pre-wrap;">{{ llm.reasoning }}</div>
-        <div v-if="llm.risk_flags && llm.risk_flags.length > 0"
-          style="display:flex;flex-direction:column;gap:3px;">
-          <span style="font-size:11px;color:#888;">风险提示</span>
-          <div v-for="(f, i) in llm.risk_flags" :key="i"
-            style="font-size:11px;color:#fbbf24;line-height:1.5;">· {{ f }}</div>
-        </div>
-        <div style="font-size:10px;color:#a855f7;line-height:1.5;">{{ llm.disclaimer }}</div>
-      </template>
       <div v-else
-        style="font-size:11px;color:#888;line-height:1.5;">
-        AI 研判不可用：{{ llm.error || '未知原因' }}<br/>
-        <span style="color:#666;">已自动降级为纯规则结果，上方结论仍然有效。</span>
+        style="padding:6px 10px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:6px;font-size:11px;color:#888;">
+        当前非盘中（{{ sessionText }}），展示最近交易日收盘数据。
       </div>
-    </div>
+
+      <!-- 技术指标 -->
+      <div v-if="ind && ind.date"
+        style="background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:8px;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:12px;color:#aaa;font-weight:600;">技术指标</span>
+          <span style="font-size:10px;color:#666;">{{ String(ind.date).slice(0, 10) }}</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px 14px;">
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">收盘</span>
+            <span style="font-size:13px;font-weight:600;" :style="{ color: chgColor(ind.chg_pct) }">{{ fmt(ind.close) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">涨跌</span>
+            <span style="font-size:13px;" :style="{ color: chgColor(ind.chg_pct) }">{{ pct(ind.chg_pct) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">MA5</span>
+            <span style="font-size:13px;" :style="{ color: maColor(ind.close, ind.ma5) }">{{ fmt(ind.ma5) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">MA10</span>
+            <span style="font-size:13px;" :style="{ color: maColor(ind.close, ind.ma10) }">{{ fmt(ind.ma10) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">MA20</span>
+            <span style="font-size:13px;" :style="{ color: maColor(ind.close, ind.ma20) }">{{ fmt(ind.ma20) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">MA60</span>
+            <span style="font-size:13px;" :style="{ color: maColor(ind.close, ind.ma60) }">{{ fmt(ind.ma60) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">量比</span>
+            <span style="font-size:13px;color:#ddd;">{{ fmt(ind.vol_ratio) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">换手</span>
+            <span style="font-size:13px;color:#ddd;">{{ pct(ind.turnover) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">RSI14</span>
+            <span style="font-size:13px;color:#ddd;">{{ fmt(ind.rsi14, 1) }}</span>
+          </div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px 14px;padding-top:6px;border-top:1px solid #2a2a2a;">
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">MACD DIF/DEA/柱</span>
+            <span style="font-size:12px;" :style="{ color: chgColor(ind.macd) }">
+              {{ fmt(ind.dif, 4) }} / {{ fmt(ind.dea, 4) }} / {{ fmt(ind.macd, 4) }}
+            </span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">BOLL 上/中/下</span>
+            <span style="font-size:12px;color:#ddd;">{{ fmt(ind.boll_up) }} / {{ fmt(ind.boll_mid) }} / {{ fmt(ind.boll_low) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">ATR14</span>
+            <span style="font-size:12px;color:#ddd;">{{ fmt(ind.atr14) }}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- K线 -->
+      <div style="background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:8px;">
+        <div style="display:flex;align-items:center;gap:8px;cursor:pointer;" @click="showKline = !showKline">
+          <span style="font-size:12px;color:#aaa;font-weight:600;">日K线（近 {{ kline.length }} 日）</span>
+          <span style="flex:1;"></span>
+          <span style="font-size:10px;color:#666;">{{ showKline ? '收起' : '展开' }}</span>
+        </div>
+        <div v-if="showKline && kline.length > 0" style="border:1px solid #2a2a2a;border-radius:6px;overflow:hidden;"
+          v-html="klineSvg()"></div>
+        <div v-else-if="showKline" style="padding:8px;text-align:center;color:#666;font-size:11px;">K线数据不可用</div>
+      </div>
+
+      <!-- 主力资金 -->
+      <div v-if="fundFlow.length > 0"
+        style="background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px;">
+        <div style="display:flex;align-items:center;gap:8px;cursor:pointer;" @click="showFund = !showFund">
+          <span style="font-size:12px;color:#aaa;font-weight:600;">主力资金（近 {{ fundFlow.length }} 日）</span>
+          <span style="flex:1;"></span>
+          <span style="font-size:10px;color:#666;">{{ showFund ? '收起' : '展开' }}</span>
+        </div>
+        <template v-if="showFund">
+          <div v-for="(r, i) in fundFlow" :key="i"
+            style="display:flex;align-items:center;gap:8px;font-size:11px;padding:2px 0;border-bottom:1px solid #232323;">
+            <span style="width:44px;color:#888;">{{ String(r['日期'] || '').slice(5, 10) }}</span>
+            <span style="flex:1;color:#ccc;">主力 {{ money(r['主力净流入-净额']) }}</span>
+            <span :style="{ color: chgColor(r['主力净流入-净占比']) }">{{ pct(r['主力净流入-净占比']) }}</span>
+          </div>
+        </template>
+      </div>
+
+      <!-- 市场情绪（涨停池） -->
+      <div v-if="zt"
+        style="background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px;">
+        <div style="display:flex;align-items:center;gap:8px;cursor:pointer;" @click="showZt = !showZt">
+          <span style="font-size:12px;color:#aaa;font-weight:600;">市场情绪</span>
+          <span style="flex:1;"></span>
+          <span style="font-size:10px;color:#666;">{{ showZt ? '收起' : '展开' }}</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px 14px;">
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">涨停家数</span>
+            <span style="font-size:13px;color:#ef4444;font-weight:600;">{{ fmt(zt.count) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">最高连板</span>
+            <span style="font-size:13px;color:#ef4444;font-weight:600;">{{ fmt(zt.max_board) }}</span>
+          </div>
+        </div>
+        <template v-if="showZt && zt.industry_rank && zt.industry_rank.length > 0">
+          <div style="font-size:11px;color:#888;margin-top:4px;">涨停行业分布</div>
+          <div style="display:flex;flex-wrap:wrap;gap:5px;">
+            <span v-for="(it, i) in zt.industry_rank.slice(0, 10)" :key="i"
+              style="padding:1px 7px;background:#252526;border:1px solid #3c3c3c;border-radius:9px;font-size:10px;color:#ddd;">
+              {{ it['行业'] || it.industry || it.name }} {{ it['涨停数'] || it.count || '' }}
+            </span>
+          </div>
+        </template>
+        <template v-if="showZt && zt.list && zt.list.length > 0">
+          <div style="font-size:11px;color:#888;margin-top:4px;">涨停个股（前 10）</div>
+          <div style="display:flex;flex-wrap:wrap;gap:5px;">
+            <span v-for="(it, i) in zt.list.slice(0, 10)" :key="i"
+              style="padding:1px 7px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);border-radius:9px;font-size:10px;color:#f87171;">
+              {{ it['名称'] || it.name }} {{ it['代码'] || it.code || '' }}
+            </span>
+          </div>
+        </template>
+      </div>
+
+      <!-- 大盘环境 -->
+      <div v-if="indexSummary"
+        style="background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px;">
+        <div style="display:flex;align-items:center;gap:8px;cursor:pointer;" @click="showMacro = !showMacro">
+          <span style="font-size:12px;color:#aaa;font-weight:600;">大盘环境（上证指数）</span>
+          <span style="flex:1;"></span>
+          <span style="font-size:10px;color:#666;">{{ showMacro ? '收起' : '展开' }}</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px 14px;">
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">收盘</span>
+            <span style="font-size:13px;color:#ddd;font-weight:600;">{{ fmt(indexSummary.close) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">近5日</span>
+            <span style="font-size:13px;" :style="{ color: chgColor(indexSummary.d5) }">{{ pct(indexSummary.d5) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">近20日</span>
+            <span style="font-size:13px;" :style="{ color: chgColor(indexSummary.d20) }">{{ pct(indexSummary.d20) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">近60日</span>
+            <span style="font-size:13px;" :style="{ color: chgColor(indexSummary.d60) }">{{ pct(indexSummary.d60) }}</span>
+          </div>
+        </div>
+        <template v-if="showMacro">
+          <div v-if="margin" style="font-size:11px;color:#aaa;margin-top:4px;">
+            两融（{{ String(margin['日期'] || '').slice(0, 10) }}）：融资余额 {{ money(margin['融资余额']) }}，融券余额 {{ money(margin['融券余额']) }}
+          </div>
+          <div v-if="north.length > 0" style="font-size:11px;color:#aaa;">
+            北向资金近 {{ north.length }} 条记录可用（详见数据源）
+          </div>
+          <div v-if="unlockList.length > 0" style="font-size:11px;color:#f59e0b;">
+            近期解禁 {{ unlockList.length }} 条，注意流通盘压力
+          </div>
+        </template>
+      </div>
+
+      <!-- 新闻 -->
+      <div v-if="newsList.length > 0"
+        style="background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px;">
+        <div style="display:flex;align-items:center;gap:8px;cursor:pointer;" @click="showNews = !showNews">
+          <span style="font-size:12px;color:#aaa;font-weight:600;">相关新闻</span>
+          <span style="flex:1;"></span>
+          <span style="font-size:10px;color:#666;">{{ showNews ? '收起' : '展开' }}</span>
+        </div>
+        <template v-if="showNews">
+          <div v-for="(n, i) in newsList" :key="i"
+            style="display:flex;flex-direction:column;gap:1px;padding:3px 0;border-bottom:1px solid #232323;">
+            <span style="font-size:11px;color:#ccc;line-height:1.4;">{{ n['新闻标题'] || n.title || '--' }}</span>
+            <span style="font-size:10px;color:#666;">{{ String(n['发布时间'] || n.time || '').slice(0, 16) }}</span>
+          </div>
+        </template>
+      </div>
+
+      <!-- 数据可用性 -->
+      <div style="display:flex;flex-wrap:wrap;gap:4px 8px;font-size:10px;color:#666;">
+        <span v-for="(v, k) in quality" :key="k">{{ qIcon(v) }} {{ k }}</span>
+      </div>
+
+      <!-- 让 Agent 分析 -->
+      <button @click="askAgent" :disabled="sending"
+        style="padding:9px 0;background:#1f6feb;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px;font-weight:600;">
+        {{ sending ? '发送中…' : '🤖 让 Agent 分析这只股票' }}
+      </button>
+      <div style="font-size:10px;color:#666;line-height:1.5;text-align:center;">
+        本面板只展示客观数据，不做预测。点击上方按钮把数据发给当前 Agent，由大模型给出分析结论。
+      </div>
+    </template>
 
     <!-- 免责声明 -->
-    <div v-if="pred && pred.success && pred.disclaimer"
-      style="padding:8px 10px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);border-radius:6px;color:#f59e0b;font-size:11px;line-height:1.5;">
-      {{ pred.disclaimer }}
-    </div>
-    <div v-else
-      style="padding:8px 10px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);border-radius:6px;color:#f59e0b;font-size:11px;line-height:1.5;">
-      {{ fallbackDisclaimer }}
+    <div style="padding:8px 10px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);border-radius:6px;color:#f59e0b;font-size:11px;line-height:1.5;">
+      {{ disclaimer }}
     </div>
   </div>
-  `,
-};
+  `,};
