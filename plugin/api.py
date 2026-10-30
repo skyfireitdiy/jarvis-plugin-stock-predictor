@@ -228,6 +228,70 @@ def get_kline(symbol, days=120):
     return pd.DataFrame()
 
 
+def get_kline_json(symbol, days=120):
+    """K线数据（JSON 版，供前端图表绘制）。
+
+    get_kline 返回 pandas DataFrame，无法经 function-call 端点 JSON 序列化
+    （后端只对 dict 返回值做处理），故此处转为纯 dict 结构。
+    成功返回 records 数组，date 统一为 "YYYY-MM-DD" 字符串。
+    """
+    code = norm_symbol(symbol)
+    df = get_kline(code, days)
+    if df is None or df.empty:
+        return {
+            "success": False,
+            "error": f"无法获取股票 {code} 的K线数据（数据源均不可用或代码无效）",
+        }
+    records = []
+    for _, row in df.iterrows():
+        records.append({
+            "date": str(row.get("date", ""))[:10],
+            "open": round(float(row.get("open")), 2) if pd.notna(row.get("open")) else None,
+            "close": round(float(row.get("close")), 2) if pd.notna(row.get("close")) else None,
+            "high": round(float(row.get("high")), 2) if pd.notna(row.get("high")) else None,
+            "low": round(float(row.get("low")), 2) if pd.notna(row.get("low")) else None,
+            "volume": int(row.get("volume")) if pd.notna(row.get("volume")) else None,
+            "amount": round(float(row.get("amount")), 0) if pd.notna(row.get("amount")) else None,
+            "turnover": round(float(row.get("turnover")), 2) if pd.notna(row.get("turnover")) else None,
+        })
+    return {"success": True, "symbol": code, "days": len(records), "kline": records}
+
+
+def watchlist(symbols, days=30):
+    """自选股批量行情快照（供前端自选股列表展示）。
+
+    对一组股票代码逐个调 quote，间隔 0.3s 控制频率避免触发数据源限流；
+    单只失败不中断整体，该项记 error 字段。
+    """
+    if isinstance(symbols, str):
+        symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+    codes = []
+    for s in symbols or []:
+        s = str(s).strip()
+        if s.isdigit() and len(s) == 6:
+            codes.append(s)
+    quotes = []
+    for code in codes:
+        try:
+            q = quote(code)
+            if q and q.get("success"):
+                quotes.append({
+                    "symbol": q.get("symbol", code),
+                    "date": q.get("date", ""),
+                    "close": q.get("close"),
+                    "chg_pct": q.get("chg_pct"),
+                    "volume_ratio": q.get("volume_ratio"),
+                    "ma5": q.get("ma5"),
+                    "ma20": q.get("ma20"),
+                })
+            else:
+                quotes.append({"symbol": code, "error": (q or {}).get("error", "获取失败")})
+        except Exception as e:  # noqa: BLE001
+            quotes.append({"symbol": code, "error": str(e)[:100]})
+        time.sleep(0.3)
+    return {"success": True, "count": len(quotes), "quotes": quotes}
+
+
 def get_fund_flow(symbol, days=10):
     """主力资金流向。东财源(stock_individual_fund_flow)，失败返回空。
 
@@ -885,4 +949,12 @@ def daily_report(symbols, days=120):
 # ---------------------------------------------------------------------------
 # gateway 前端代理白名单（仅这些函数可被调用）
 # ---------------------------------------------------------------------------
-PUBLIC_FUNCTIONS = ["predict", "quote", "analyze", "daily_report", "get_kline"]
+PUBLIC_FUNCTIONS = [
+    "predict",
+    "quote",
+    "analyze",
+    "daily_report",
+    "get_kline",
+    "get_kline_json",
+    "watchlist",
+]

@@ -15,6 +15,12 @@ logo: >-
   <path d="M3.5 10l2.5-3 2 1.5 3.5-5"/>
   <path d="M9 3.5h2v2"/>
   </svg>
+frontend:
+  sidebar_views:
+    - id: stock-predictor
+      title: "A股预测"
+      entry: sidebar_view.js
+      icon: frontend/icon.svg
 tool_load_dirs:
   - "{{plugin_dir}}/tools"
 rules_load_dirs:
