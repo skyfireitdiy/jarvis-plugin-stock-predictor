@@ -7,7 +7,7 @@ description: >-
   主力资金流、涨停池情绪、上证指数环境、两融余额、北向资金、解禁信息与个股新闻。
   插件本身不做打分、不预测方向，分析结论由 Agent 基于这些数据自行给出。
   支持对话问答、侧边栏数据面板（一键让 Agent 分析）与定时盘后日报。
-version: 0.2.0
+version: 0.2.3
 license: MIT
 logo: >-
   <svg viewBox="0 0 16 16" fill="none" stroke="#ef4444" stroke-width="1.5"
