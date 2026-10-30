@@ -357,11 +357,8 @@ export default {
       }
     },
     // ---- 让 Agent 分析 ----
-    askAgent() {
-      if (!this.snap) {
-        this.toast("请先加载一只股票的数据", "warning");
-        return;
-      }
+    // 构建发给 Agent 的数据摘要文本（两个发送动作共用）
+    buildPrompt() {
       const s = this.snap;
       const ind = this.ind || {};
       const intra = this.intra;
@@ -448,6 +445,14 @@ export default {
       );
 
       const text = lines.join("\n");
+      return text;
+    },
+    // 动作一：发给当前正在对话的 Agent
+    askAgent() {
+      if (!this.snap) {
+        this.toast("请先加载一只股票的数据", "warning");
+        return;
+      }
       const send =
         typeof window !== "undefined" && window.__jarvisSendToActiveAgent;
       if (typeof send !== "function") {
@@ -456,13 +461,67 @@ export default {
       }
       this.sending = true;
       try {
-        send(text, { silent: true });
+        send(this.buildPrompt(), { silent: true });
         this.toast("已发送给当前 Agent，请在对话中查看分析", "success");
       } catch (e) {
         this.toast("发送失败：" + ((e && e.message) || "未知错误"), "error");
       } finally {
         this.sending = false;
       }
+    },
+    // 动作二：新建一个独立 Agent 专门分析这只股票（复用宿主创建 Agent 弹窗，用户可确认/改参数）
+    askNewAgent() {
+      if (!this.snap) {
+        this.toast("请先加载一只股票的数据", "warning");
+        return;
+      }
+      if (typeof window === "undefined") return;
+      const openModal = window.__jarvisOpenCreateAgentModal;
+      const create = window.__jarvisCreateAgentForTask;
+      if (typeof openModal !== "function" && typeof create !== "function") {
+        this.toast("当前环境不支持创建 Agent", "warning");
+        return;
+      }
+      const code = this.snap.code || "";
+      const prompt = this.buildPrompt();
+      this.sending = true;
+      const finish = (msg, type) => {
+        this.sending = false;
+        this.toast(msg, type);
+      };
+      if (typeof openModal === "function") {
+        // 优先走弹窗：不预填工作目录，由用户自行选择节点与目录
+        Promise.resolve(
+          openModal({
+            task: prompt,
+            name: "A股分析 " + code,
+          }),
+        )
+          .then((res) => {
+            if (res && res.confirmed) {
+              finish("已创建新 Agent 分析 " + code, "success");
+            } else {
+              finish("已取消创建", "warning");
+            }
+          })
+          .catch((e) => finish("创建失败：" + ((e && e.message) || "未知错误"), "error"));
+        return;
+      }
+      // 兜底：宿主没有弹窗钩子时直接创建（需要工作目录，缺省用当前用户主目录）
+      const workingDir =
+        (typeof window.__jarvisGetActiveAgentInfo === "function" &&
+          (window.__jarvisGetActiveAgentInfo() || {}).working_dir) ||
+        "";
+      if (!workingDir) {
+        finish("宿主未提供创建弹窗，且无法确定工作目录", "warning");
+        return;
+      }
+      Promise.resolve(create({ workingDir, task: prompt, name: "A股分析 " + code }))
+        .then((r) => {
+          if (r && r.success) finish("已创建新 Agent 分析 " + code, "success");
+          else finish("创建失败：" + ((r && r.error) || "未知错误"), "error");
+        })
+        .catch((e) => finish("创建失败：" + ((e && e.message) || "未知错误"), "error"));
     },
     toast(message, type) {
       const t = typeof window !== "undefined" && window.__jarvisShowToast;
@@ -907,10 +966,14 @@ export default {
            中文长串不会自动换行，文字会溢出被裁掉。必须 flex-shrink:0 + width:100% + nowrap。 -->
       <button @click="askAgent" :disabled="sending"
         style="display:block;flex:0 0 auto;width:100%;min-height:44px;box-sizing:border-box;padding:12px 10px;background:#1f6feb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:600;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-        {{ sending ? '发送中…' : '🤖 让 Agent 分析' }}
+        {{ sending ? '发送中…' : '💬 发给当前 Agent' }}
+      </button>
+      <button @click="askNewAgent" :disabled="sending"
+        style="display:block;flex:0 0 auto;width:100%;min-height:44px;box-sizing:border-box;padding:12px 10px;background:#238636;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:600;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+        {{ sending ? '处理中…' : '🆕 新建 Agent 分析' }}
       </button>
       <div style="font-size:10px;color:#666;line-height:1.5;text-align:center;">
-        本面板只展示客观数据，不做预测。点击上方按钮把数据发给当前 Agent，由大模型给出分析结论。
+        本面板只展示客观数据，不做预测。可发给当前 Agent 继续对话，或新建一个独立 Agent 专门分析这只股票。
       </div>
     </template>
 
