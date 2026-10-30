@@ -903,9 +903,11 @@ export default {
       </div>
 
       <!-- 让 Agent 分析 -->
+      <!-- 注意：父容器是 flex column，按钮默认 flex-shrink:1 会被压窄；
+           中文长串不会自动换行，文字会溢出被裁掉。必须 flex-shrink:0 + width:100% + nowrap。 -->
       <button @click="askAgent" :disabled="sending"
-        style="padding:9px 0;background:#1f6feb;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px;font-weight:600;">
-        {{ sending ? '发送中…' : '🤖 让 Agent 分析这只股票' }}
+        style="display:block;flex:0 0 auto;width:100%;min-height:44px;box-sizing:border-box;padding:12px 10px;background:#1f6feb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:600;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+        {{ sending ? '发送中…' : '🤖 让 Agent 分析' }}
       </button>
       <div style="font-size:10px;color:#666;line-height:1.5;text-align:center;">
         本面板只展示客观数据，不做预测。点击上方按钮把数据发给当前 Agent，由大模型给出分析结论。
