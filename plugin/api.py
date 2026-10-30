@@ -1448,6 +1448,12 @@ def predict(symbol, days=120, mode="rule"):
     # 盘中时以现价为区间基准（预测"后续走势"相对当前价）
     ref_price = float(snap["price"]) if (is_intraday and snap.get("price")) else last_close
     atr_pct = atr / ref_price * 100 if ref_price else 1.5
+    # 盘中：预测周期是"剩余交易时间至收盘"，波动幅度需按剩余时间折算。
+    # 用 √(剩余分钟/240) 缩放（波动率随时间平方根增长，布朗运动假设）。
+    # 例：13:28 剩 92 分钟 → 缩放 √(92/240)=0.62，避免用全天 ATR 给出过宽区间。
+    if is_intraday:
+        remain = max(5, 240 - int(snap.get("trade_minutes") or 0))
+        atr_pct *= math.sqrt(remain / 240.0)
     shift = total / 100 * atr_pct * 0.6  # 方向性偏移
     low_pct = max(-10, min(10, shift - atr_pct * 0.5))
     high_pct = max(-10, min(10, shift + atr_pct * 0.5))
@@ -1465,6 +1471,8 @@ def predict(symbol, days=120, mode="rule"):
     signals = _tech_signals(kline) + _event_signals(code, kline)
     if is_intraday:
         signals = _intraday_signals(snap) + signals
+        if not signals:
+            signals = ["⚪ 盘中暂无明显异动信号，走势平稳，建议持续观察"]
     # 最近交易日与收盘
     trade_date = str(kline["date"].iloc[-1])[:10]
 
