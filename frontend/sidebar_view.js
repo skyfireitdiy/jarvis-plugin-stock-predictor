@@ -496,7 +496,7 @@ export default {
     },
   },
   template: `
-  <div style="display:flex;flex-direction:column;gap:10px;padding:10px;font-size:13px;color:#ddd;background:transparent;">
+  <div style="display:flex;flex-direction:column;gap:10px;padding:10px;font-size:13px;color:#ddd;background:transparent;height:100%;overflow:auto;box-sizing:border-box;">
     <!-- 搜索框 -->
     <div style="display:flex;gap:6px;">
       <input v-model="searchInput" placeholder="输入 6 位股票代码" @keydown.enter.prevent="doSearch"
