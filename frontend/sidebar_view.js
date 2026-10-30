@@ -83,18 +83,20 @@ async function callFunction(functionName, args, nodeId) {
 }
 
 // 方向 → 徽章配色（A股习惯：红涨绿跌）
-function directionColor(dir) {
+// 注意：这些是模块顶层纯函数，仅供组件 methods 内调用；
+// 模板里通过实例方法 directionColor/directionBg/scoreColor 间接访问（见 methods）。
+function directionColorTop(dir) {
   if (dir === "看涨") return "#ef4444";
   if (dir === "看跌") return "#22c55e";
   return "#888888";
 }
-function directionBg(dir) {
+function directionBgTop(dir) {
   if (dir === "看涨") return "rgba(239,68,68,0.15)";
   if (dir === "看跌") return "rgba(34,197,94,0.15)";
   return "rgba(136,136,136,0.15)";
 }
 // 得分色：>0 红（A股做多情绪）<0 绿，0 灰
-function scoreColor(s) {
+function scoreColorTop(s) {
   if (s > 0) return "#ef4444";
   if (s < 0) return "#22c55e";
   return "#888888";
@@ -143,6 +145,17 @@ export default {
     },
   },
   methods: {
+    // 模板中使用的工具函数（模板只能访问组件实例上的方法/属性，
+    // 模块顶层函数不会暴露到实例，否则渲染时会 TypeError 导致组件空白）
+    directionColor(dir) {
+      return directionColorTop(dir);
+    },
+    directionBg(dir) {
+      return directionBgTop(dir);
+    },
+    scoreColor(s) {
+      return scoreColorTop(s);
+    },
     // ---- 自选股管理 ----
     loadWatchlist() {
       try {
