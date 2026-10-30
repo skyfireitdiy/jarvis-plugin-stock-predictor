@@ -121,6 +121,8 @@ export default {
       expandedDim: "",
       // 自选行情缓存（watchlist 接口结果，key=symbol）
       quoteCache: {},
+      // 预测模式：rule=纯规则 / hybrid=规则+AI研判（默认 rule，不调 LLM）
+      mode: "rule",
     };
   },
   mounted() {
@@ -133,6 +135,25 @@ export default {
     // 兜底免责声明（模板可访问）
     fallbackDisclaimer() {
       return FALLBACK_DISCLAIMER;
+    },
+    // 是否盘中实时预测
+    isIntraday() {
+      return !!(this.pred && this.pred.success && this.pred.is_intraday);
+    },
+    // 盘中时段文字
+    sessionText() {
+      const s = this.pred && this.pred.session_state;
+      if (s === "trading") return "盘中交易中";
+      if (s === "lunch_break") return "午间休市";
+      return "盘中";
+    },
+    // 盘中快照
+    snap() {
+      return (this.pred && this.pred.intraday) || null;
+    },
+    // LLM 研判（仅 hybrid 模式且后端返回时存在）
+    llm() {
+      return (this.pred && this.pred.llm) || null;
     },
     // 按权重降序排列的维度列表
     dimsList() {
@@ -224,7 +245,7 @@ export default {
       this.kline = [];
       // 并行拉取预测 + K线
       const results = await Promise.allSettled([
-        callFunction("predict", { symbol: code, days: 120 }),
+        callFunction("predict", { symbol: code, days: 120, mode: this.mode }),
         callFunction("get_kline_json", { symbol: code, days: 60 }),
       ]);
       this.loading = false;
@@ -252,6 +273,13 @@ export default {
       this.refreshQuotes(true);
     },
     refresh() {
+      if (this.current) this.load(this.current);
+    },
+    // 切换预测模式（rule=纯规则快速；hybrid=规则+AI研判，较慢）
+    setMode(m) {
+      if (m !== "rule" && m !== "hybrid") return;
+      if (this.mode === m) return;
+      this.mode = m;
       if (this.current) this.load(this.current);
     },
     // 批量拉自选行情（throttle：同一只 30s 内不重复拉，防后端限流）
@@ -550,6 +578,65 @@ export default {
         <button @click="refresh" title="刷新"
           style="padding:3px 8px;background:#252526;color:#aaa;border:1px solid #3c3c3c;border-radius:4px;cursor:pointer;font-size:11px;">⟳</button>
       </div>
+
+      <!-- 模式切换：纯规则 / 规则+AI -->
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+        <span style="font-size:11px;color:#888;">模式</span>
+        <button @click="setMode('rule')" :disabled="loading"
+          style="padding:3px 10px;border-radius:10px;cursor:pointer;font-size:11px;"
+          :style="mode === 'rule'
+            ? 'background:rgba(31,111,235,0.2);color:#58a6ff;border:1px solid #1f6feb;'
+            : 'background:#252526;color:#888;border:1px solid #3c3c3c;'">纯规则</button>
+        <button @click="setMode('hybrid')" :disabled="loading"
+          style="padding:3px 10px;border-radius:10px;cursor:pointer;font-size:11px;"
+          :style="mode === 'hybrid'
+            ? 'background:rgba(168,85,247,0.2);color:#c084fc;border:1px solid #a855f7;'
+            : 'background:#252526;color:#888;border:1px solid #3c3c3c;'">规则 + AI 研判</button>
+        <span style="flex:1;"></span>
+        <span v-if="isIntraday"
+          style="padding:2px 8px;border-radius:10px;font-size:10px;background:rgba(34,197,94,0.15);color:#4ade80;border:1px solid rgba(34,197,94,0.4);">
+          ● {{ sessionText }}
+        </span>
+      </div>
+
+      <!-- 盘中实时行情 -->
+      <div v-if="isIntraday && snap"
+        style="display:flex;flex-wrap:wrap;gap:10px;padding:8px 10px;background:#161b22;border:1px solid #2a3a4a;border-radius:6px;">
+        <div style="display:flex;flex-direction:column;gap:2px;">
+          <span style="font-size:10px;color:#888;">现价</span>
+          <span style="font-size:15px;font-weight:600;"
+            :style="{ color: Number(snap.chg_pct) > 0 ? '#ef4444' : (Number(snap.chg_pct) < 0 ? '#22c55e' : '#ddd') }">
+            {{ snap.price }}
+          </span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:2px;">
+          <span style="font-size:10px;color:#888;">涨跌</span>
+          <span style="font-size:13px;font-weight:600;"
+            :style="{ color: Number(snap.chg_pct) > 0 ? '#ef4444' : (Number(snap.chg_pct) < 0 ? '#22c55e' : '#ddd') }">
+            {{ Number(snap.chg_pct) > 0 ? '+' : '' }}{{ snap.chg_pct }}%
+          </span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:2px;">
+          <span style="font-size:10px;color:#888;">相对均价</span>
+          <span style="font-size:13px;color:#ddd;">{{ snap.chg_vs_vwap == null ? '--' : (Number(snap.chg_vs_vwap) > 0 ? '+' : '') + snap.chg_vs_vwap + '%' }}</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:2px;">
+          <span style="font-size:10px;color:#888;">日内位置</span>
+          <span style="font-size:13px;color:#ddd;">{{ snap.pos_in_range == null ? '--' : snap.pos_in_range + '%' }}</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:2px;">
+          <span style="font-size:10px;color:#888;">盘中量比</span>
+          <span style="font-size:13px;color:#ddd;">{{ snap.vol_ratio_intraday == null ? '--' : snap.vol_ratio_intraday }}</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:2px;">
+          <span style="font-size:10px;color:#888;">30分钟动量</span>
+          <span style="font-size:13px;color:#ddd;">{{ snap.mom30 == null ? '--' : (Number(snap.mom30) > 0 ? '+' : '') + snap.mom30 + '%' }}</span>
+        </div>
+        <div style="width:100%;font-size:10px;color:#666;">
+          数据截至 {{ snap.updated_at || '--' }} · 来源 {{ snap.source || '--' }}
+          <span v-if="snap.partial" style="color:#f59e0b;">（降级数据，部分指标不可用）</span>
+        </div>
+      </div>
       <!-- 方向徽章 + 关键指标 -->
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
         <span
@@ -625,6 +712,48 @@ export default {
       <div v-for="(s, i) in pred.signals" :key="i"
         style="font-size:12px;color:#fbbf24;line-height:1.5;">
         {{ s }}
+      </div>
+    </div>
+
+    <!-- AI 研判（规则 + AI 双轨对照） -->
+    <div v-if="pred && pred.success && llm"
+      style="background:#1e1e1e;border:1px solid #4c1d95;border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:8px;">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:12px;color:#c084fc;font-weight:600;">🤖 AI 研判</span>
+        <span v-if="llm.available"
+          style="padding:1px 8px;border-radius:10px;font-size:10px;background:rgba(168,85,247,0.15);color:#c084fc;border:1px solid rgba(168,85,247,0.4);">
+          {{ llm.model_group || 'normal' }} · {{ llm.elapsed }}s
+        </span>
+      </div>
+      <template v-if="llm.available">
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+          <span style="padding:4px 12px;border-radius:14px;font-size:13px;font-weight:600;"
+            :style="{ background: directionBg(llm.direction), color: directionColor(llm.direction), border: '1px solid ' + directionColor(llm.direction) }">
+            {{ llm.direction }}
+          </span>
+          <span style="font-size:11px;color:#888;">AI 置信度 <span style="color:#ddd;font-weight:600;">{{ llm.confidence }}%</span></span>
+        </div>
+        <div v-if="pred.conflict"
+          style="padding:6px 8px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.4);border-radius:4px;color:#f59e0b;font-size:11px;line-height:1.5;">
+          ⚠️ 规则结论（{{ pred.rule_result ? pred.rule_result.direction : '--' }}）与 AI 研判方向分歧，请谨慎参考，勿单边操作。
+        </div>
+        <div v-else-if="pred.rule_result"
+          style="font-size:11px;color:#888;">
+          规则结论：{{ pred.rule_result.direction }}（得分 {{ pred.rule_result.score }}，置信度 {{ pred.rule_result.confidence }}%）· 与 AI 方向一致
+        </div>
+        <div style="font-size:12px;color:#ccc;line-height:1.6;white-space:pre-wrap;">{{ llm.reasoning }}</div>
+        <div v-if="llm.risk_flags && llm.risk_flags.length > 0"
+          style="display:flex;flex-direction:column;gap:3px;">
+          <span style="font-size:11px;color:#888;">风险提示</span>
+          <div v-for="(f, i) in llm.risk_flags" :key="i"
+            style="font-size:11px;color:#fbbf24;line-height:1.5;">· {{ f }}</div>
+        </div>
+        <div style="font-size:10px;color:#a855f7;line-height:1.5;">{{ llm.disclaimer }}</div>
+      </template>
+      <div v-else
+        style="font-size:11px;color:#888;line-height:1.5;">
+        AI 研判不可用：{{ llm.error || '未知原因' }}<br/>
+        <span style="color:#666;">已自动降级为纯规则结果，上方结论仍然有效。</span>
       </div>
     </div>
 
