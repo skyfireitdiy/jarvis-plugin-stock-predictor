@@ -32,6 +32,10 @@ try:
     import akshare as ak
 except Exception:  # pragma: no cover
     ak = None
+try:
+    import requests as _requests
+except Exception:  # pragma: no cover
+    _requests = None
 
 # ---------------------------------------------------------------------------
 # 常量与配置
@@ -69,6 +73,7 @@ _unlock_cache = {"data": None, "ts": 0}
 _kline_cache = {"data": {}}  # code -> {"df": DataFrame, "ts": float}
 _intraday_cache = {"data": {}, "ts": {}}  # code -> snapshot dict, TTL 45s（仅盘中缓存）
 _news_cache = {"data": {}, "ts": {}}  # code -> DataFrame, TTL 5min
+_name_cache = {"data": {}, "ts": {}}  # code -> 股票名称(str)，TTL 24h（名称几乎不变）
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +157,44 @@ def exchange_prefix(symbol):
     if s.startswith(("4", "8")):
         return "bj" + s
     return "sz" + s
+
+
+def _get_stock_name(symbol):
+    """获取 A 股股票名称（新浪 hq.sinajs.cn 单只实时行情，极轻量 0.02s）。
+
+    返回格式：var hq_str_sh600519="贵州茅台,1363.000,..."，首字段即名称。
+    带模块级缓存（名称几乎不变，TTL 24h）。失败返回 None，不抛异常。
+    """
+    code = norm_symbol(symbol)
+    now = time.time()
+    if code in _name_cache["data"] and now - _name_cache["ts"].get(code, 0) < 24 * 3600:
+        return _name_cache["data"][code]
+    if _requests is None:
+        return None
+    try:
+        r = _requests.get(
+            "https://hq.sinajs.cn/list=" + exchange_prefix(code),
+            headers={
+                "Referer": "https://finance.sina.com.cn",
+                "User-Agent": "Mozilla/5.0",
+            },
+            timeout=5,
+        )
+        if r.status_code == 200:
+            # 形如 var hq_str_sh600519="贵州茅台,1363.000,...";
+            text = r.text
+            start = text.find('"')
+            end = text.rfind('"')
+            if start != -1 and end > start:
+                fields = text[start + 1 : end].split(",")
+                name = fields[0].strip() if fields else ""
+                if name:
+                    _name_cache["data"][code] = name
+                    _name_cache["ts"][code] = now
+                    return name
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def _safe_float(v, ndigits=None):
@@ -839,6 +882,7 @@ def get_snapshot(symbol, days=120):
         "is_intraday": is_intraday,
         "disclaimer": DISCLAIMER,
     }
+    snap["name"] = _get_stock_name(code)
 
     # 1) 日K + 技术指标
     df = None
@@ -1023,6 +1067,7 @@ def watchlist(symbols):
         try:
             code = norm_symbol(c)
             item = {"symbol": code, "session_state": session_state}
+            item["name"] = _get_stock_name(code)
             df = get_kline(code, days=30)
             if df is not None and not df.empty:
                 last = df.iloc[-1]

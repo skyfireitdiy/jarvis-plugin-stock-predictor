@@ -425,10 +425,16 @@ export default {
       }
       if (this.newsList.length > 0) {
         lines.push("近期新闻：");
-        this.newsList.slice(0, 6).forEach((n, i) => {
+        this.newsList.forEach((n, i) => {
+          const title = n["新闻标题"] || "";
+          const content = String(n["新闻内容"] || "").trim();
+          // 标题与内容相同则只给标题，避免重复；内容过长截断到 120 字
+          const body = content && content !== title
+            ? "，" + content.slice(0, 120)
+            : "";
           lines.push(
             "  " + (i + 1) + ". [" + String(n["发布时间"] || "").slice(0, 16) +
-              "] " + (n["新闻标题"] || ""),
+              "] " + title + body,
           );
         });
       }
@@ -685,7 +691,9 @@ export default {
       <span v-for="c in watchlist" :key="c" @click="switchStock(c)"
         style="display:inline-flex;align-items:center;gap:4px;padding:2px 6px;background:#252526;border:1px solid #3c3c3c;border-radius:10px;cursor:pointer;font-size:11px;color:#ddd;"
         :style="c === current ? 'border-color:#1f6feb;color:#58a6ff;' : ''">
-        <span :style="{ color: quoteCache[c] ? chgColor(quoteCache[c].chg_pct) : '#ddd' }">{{ c }}</span>
+        <span :style="{ color: quoteCache[c] ? chgColor(quoteCache[c].chg_pct) : '#ddd' }">
+          {{ quoteCache[c] && quoteCache[c].name ? quoteCache[c].name + ' ' + c : c }}
+        </span>
         <span v-if="quoteCache[c] && quoteCache[c].price != null" style="font-size:10px;opacity:0.85;">{{ fmt(quoteCache[c].price) }}</span>
         <span v-if="quoteCache[c] && quoteCache[c].chg_pct != null" style="font-size:10px;"
           :style="{ color: chgColor(quoteCache[c].chg_pct) }">{{ pct(quoteCache[c].chg_pct) }}</span>
