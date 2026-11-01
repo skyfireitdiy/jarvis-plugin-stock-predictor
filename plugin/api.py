@@ -1043,7 +1043,35 @@ PUBLIC_FUNCTIONS = [
     "get_north_flow",
     "get_unlock",
     "watchlist",
+    "get_names",
 ]
+
+
+def get_names(symbols):
+    """
+    批量获取股票名称（极轻量，仅调新浪 hq.sinajs.cn 单只行情取名称，不拉行情）。
+
+    供前端自选股列表在打开面板时快速显示名称，避免触发完整行情抓取。
+    symbols: 代码列表或逗号分隔字符串。
+    返回 {"names": {code: name}, "errors": [...]}
+    """
+    if isinstance(symbols, str):
+        codes = [s.strip() for s in symbols.replace("，", ",").split(",") if s.strip()]
+    elif isinstance(symbols, (list, tuple)):
+        codes = [str(s).strip() for s in symbols if str(s).strip()]
+    else:
+        return {"names": {}, "errors": [{"error": "symbols 参数格式不支持"}]}
+    names, errors = {}, []
+    for c in codes:
+        try:
+            name = _get_stock_name(c)
+            if name:
+                names[norm_symbol(c)] = name
+            else:
+                errors.append({"symbol": c, "error": "未取到名称"})
+        except Exception as e:  # noqa: BLE001
+            errors.append({"symbol": c, "error": str(e)[:200]})
+    return {"names": names, "errors": errors}
 
 
 def watchlist(symbols):

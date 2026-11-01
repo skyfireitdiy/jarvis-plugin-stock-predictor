@@ -132,8 +132,9 @@ export default {
   },
   mounted() {
     this.loadWatchlist();
-    // 注意：mounted 里不自动加载自选股——否则用户每次打开侧边栏都会触发一次
-    // 约 10 秒的全量数据抓取（9 个数据源），既慢又浪费。由用户主动点击切换。
+    // 打开面板时对自选股做一次轻量名称获取（仅拉名称，不触发 10 秒全量抓取），
+    // 让自选股 chip 能显示「名称 代码」。完整行情（价格/涨跌）由用户点击后 refreshQuotes 拉取。
+    this.loadWatchlistNames();
   },
   computed: {
     fallbackDisclaimer() {
@@ -354,6 +355,26 @@ export default {
         }
       } catch (e) {
         if (!silent) this.toast((e && e.message) || "自选行情获取失败", "error");
+      }
+    },
+    // 轻量获取自选股名称（仅名称，不拉行情），供自选 chip 显示「名称 代码」
+    async loadWatchlistNames() {
+      if (this.watchlist.length === 0) return;
+      try {
+        const res = await callFunction("get_names", {
+          symbols: this.watchlist,
+        });
+        if (res && res.names && typeof res.names === "object") {
+          for (const code of Object.keys(res.names)) {
+            const name = res.names[code];
+            if (!name) continue;
+            this.quoteCache[code] = Object.assign({}, this.quoteCache[code], {
+              name: name,
+            });
+          }
+        }
+      } catch (e) {
+        // 名称获取失败不阻断，自选 chip 回退显示代码（静默，不打扰用户）
       }
     },
     // ---- 让 Agent 分析 ----
