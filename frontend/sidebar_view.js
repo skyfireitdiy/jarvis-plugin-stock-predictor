@@ -119,6 +119,7 @@ export default {
       watchlist: [],
       current: "",
       loading: false,
+      pendingSymbol: "",
       error: "",
       snap: null,
       quoteCache: {},
@@ -308,9 +309,16 @@ export default {
       this.switchStock(code);
     },
     // ---- 数据加载 ----
+    // 后端 get_snapshot_json 是同步阻塞调用（约 10s），并发请求会阻塞整个网关。
+    // 因此前端同一时刻只允许一个快照请求：加载中再次点击只记录最新目标，
+    // 等当前请求结束后再加载，避免连点两只股票把网关卡死。
     async load(symbol) {
       const code = String(symbol || "").trim();
       if (!/^\d{6}$/.test(code)) return;
+      if (this.loading) {
+        this.pendingSymbol = code;
+        return;
+      }
       this.loading = true;
       this.error = "";
       this.snap = null;
@@ -322,15 +330,24 @@ export default {
         if (!data || typeof data !== "object") {
           throw new Error("返回数据为空");
         }
+        if (data.success === false) {
+          throw new Error(data.error || "数据获取失败");
+        }
+        // 加载期间用户已切换到别的股票，丢弃本次结果
+        if (this.current !== code) return;
         this.snap = data;
         this.addToWatchlist(code);
         this.refreshQuotes(true);
       } catch (e) {
+        if (this.current !== code) return;
         const msg = (e && e.message) || "数据获取失败";
         this.error = msg;
         this.toast(msg, "error");
       } finally {
         this.loading = false;
+        const next = this.pendingSymbol;
+        this.pendingSymbol = "";
+        if (next && next !== code) this.load(next);
       }
     },
     refresh() {

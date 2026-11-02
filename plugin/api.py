@@ -75,6 +75,20 @@ _intraday_cache = {"data": {}, "ts": {}}  # code -> snapshot dict, TTL 45s（仅
 _news_cache = {"data": {}, "ts": {}}  # code -> DataFrame, TTL 5min
 _name_cache = {"data": {}, "ts": {}}  # code -> 股票名称(str)，TTL 24h（名称几乎不变）
 
+# 单只股票快照构建锁：get_snapshot 是同步阻塞函数（约 10s），而 gateway 的
+# function-call 端点直接在当前事件循环里同步执行它。若前端同时发起两次快照请求
+# （如连点两只自选股），第二个请求会阻塞整个网关事件循环，表现为"网关卡死"。
+# 这里用锁把并发快照串行化，后来者立即返回 busy，避免长时间占用事件循环。
+_snapshot_lock = threading.Lock()
+
+# 快照分块与依赖关系（供 get_snapshot 按需取数，避免只取一个维度却拉全部数据）
+SNAPSHOT_SECTIONS = (
+    "kline", "intraday", "fund_flow", "index", "zt_pool",
+    "news", "margin", "north_flow", "unlock",
+)
+# 各分块依赖的其它分块（如资金面需要北向资金）
+SECTION_DEPS = {"fund": ("fund_flow", "north_flow")}
+
 
 # ---------------------------------------------------------------------------
 # 工具函数：缓存 / 重试 / 归一化
@@ -847,9 +861,29 @@ def _clean(obj):
     return obj
 
 
-def get_snapshot(symbol, days=120):
+def _resolve_sections(sections):
+    """把 sections 参数归一化为分块名元组；None/空 表示全部。"""
+    if not sections:
+        return SNAPSHOT_SECTIONS
+    if isinstance(sections, str):
+        sections = [s.strip() for s in sections.replace("，", ",").split(",")]
+    wanted = []
+    for s in sections:
+        name = str(s or "").strip()
+        if not name:
+            continue
+        for sec in SECTION_DEPS.get(name, (name,)):
+            if sec in SNAPSHOT_SECTIONS and sec not in wanted:
+                wanted.append(sec)
+    return tuple(wanted)
+
+
+def get_snapshot(symbol, days=120, sections=None):
     """
     汇总单只股票的全部原始数据，供 Agent 做多维度分析。
+
+    sections: 可选，只取部分数据块（如 ["kline"] / ["fund"]），用于减少耗时与
+    网络请求；不传则取全部。未取的分块在返回结构中为 None（data_quality 无对应键）。
 
     返回结构（各字段失败时为 None / [] / {}，不抛异常）：
     {
@@ -869,6 +903,7 @@ def get_snapshot(symbol, days=120):
     }
     """
     code = norm_symbol(symbol)
+    secs = _resolve_sections(sections)
     quality = {}
     now = dt.datetime.now()
     is_intraday, session_state = is_trading_session(now)
@@ -886,12 +921,16 @@ def get_snapshot(symbol, days=120):
 
     # 1) 日K + 技术指标
     df = None
-    try:
-        df = get_kline(code, days=days)
-        quality["kline"] = "ok" if (df is not None and not df.empty) else "empty"
-    except Exception:
-        quality["kline"] = "error"
-    if df is not None and not df.empty:
+    if "kline" in secs:
+        try:
+            df = get_kline(code, days=days)
+            quality["kline"] = "ok" if (df is not None and not df.empty) else "empty"
+        except Exception:
+            quality["kline"] = "error"
+    if "kline" not in secs:
+        snap["kline"] = None
+        snap["indicators"] = None
+    elif df is not None and not df.empty:
         try:
             ind_df = _calc_indicators(df)
             # kline 带上指标列，Agent 可自行判断形态（如 MA 多头排列、MACD 金叉位置）
@@ -914,116 +953,153 @@ def get_snapshot(symbol, days=120):
         quality.setdefault("indicators", "empty")
 
     # 2) 盘中快照
-    try:
-        intra = get_intraday(code)
-        if intra and intra.get("available"):
-            snap["intraday"] = _clean(intra)
-            quality["intraday"] = "ok"
-        else:
+    if "intraday" in secs:
+        try:
+            intra = get_intraday(code)
+            if intra and intra.get("available"):
+                snap["intraday"] = _clean(intra)
+                quality["intraday"] = "ok"
+            else:
+                snap["intraday"] = None
+                quality["intraday"] = "not_available"
+        except Exception:
             snap["intraday"] = None
-            quality["intraday"] = "not_available"
-    except Exception:
+            quality["intraday"] = "error"
+    else:
         snap["intraday"] = None
-        quality["intraday"] = "error"
 
     # 3) 个股资金流（近10日主力/超大单/大单/中单/小单净流入）
-    time.sleep(0.4)  # 数据源间隔，降低东财限流概率
-    try:
-        ff = get_fund_flow(code)
-        snap["fund_flow"] = _df_to_records(ff, limit=10) if ff is not None and not ff.empty else None
-        quality["fund_flow"] = "ok" if snap["fund_flow"] else "empty"
-    except Exception:
+    if "fund_flow" in secs:
+        time.sleep(0.4)  # 数据源间隔，降低东财限流概率
+        try:
+            ff = get_fund_flow(code)
+            snap["fund_flow"] = _df_to_records(ff, limit=10) if ff is not None and not ff.empty else None
+            quality["fund_flow"] = "ok" if snap["fund_flow"] else "empty"
+        except Exception:
+            snap["fund_flow"] = None
+            quality["fund_flow"] = "error"
+    else:
         snap["fund_flow"] = None
-        quality["fund_flow"] = "error"
 
     # 4) 大盘指数（上证近60日，供 Agent 判断大盘环境）
-    time.sleep(0.4)
-    try:
-        idx = get_index_kline()
-        snap["index"] = _df_to_records(idx, limit=60) if idx is not None and not idx.empty else None
-        quality["index"] = "ok" if snap["index"] else "empty"
-    except Exception:
+    if "index" in secs:
+        time.sleep(0.4)
+        try:
+            idx = get_index_kline()
+            snap["index"] = _df_to_records(idx, limit=60) if idx is not None and not idx.empty else None
+            quality["index"] = "ok" if snap["index"] else "empty"
+        except Exception:
+            snap["index"] = None
+            quality["index"] = "error"
+    else:
         snap["index"] = None
-        quality["index"] = "error"
 
     # 5) 涨停池（市场情绪面：涨停家数/连板高度/封板资金/所属行业）
-    time.sleep(0.4)
-    try:
-        zt = get_zt_pool()
-        zt_recs = _df_to_records(zt, limit=200) if zt is not None and not zt.empty else []
-        if zt_recs:
-            # 统计摘要 + 明细，Agent 无需自行聚合
-            industries = {}
-            for r in zt_recs:
-                ind = r.get("所属行业") or "未知"
-                industries[ind] = industries.get(ind, 0) + 1
-            boards = [r.get("连板数") for r in zt_recs if isinstance(r.get("连板数"), (int, float))]
-            snap["zt_pool"] = {
-                "count": len(zt_recs),
-                "max_board": max(boards) if boards else None,
-                "industry_rank": sorted(
-                    [{"industry": k, "count": v} for k, v in industries.items()],
-                    key=lambda x: -x["count"],
-                )[:10],
-                "list": zt_recs,
-            }
-            quality["zt_pool"] = "ok"
-        else:
-            snap["zt_pool"] = None
-            quality["zt_pool"] = "empty"
-    except Exception:
+    if "zt_pool" not in secs:
         snap["zt_pool"] = None
-        quality["zt_pool"] = "error"
+    else:
+        time.sleep(0.4)
+        try:
+            zt = get_zt_pool()
+            zt_recs = _df_to_records(zt, limit=200) if zt is not None and not zt.empty else []
+            if zt_recs:
+                # 统计摘要 + 明细，Agent 无需自行聚合
+                industries = {}
+                for r in zt_recs:
+                    ind = r.get("所属行业") or "未知"
+                    industries[ind] = industries.get(ind, 0) + 1
+                boards = [r.get("连板数") for r in zt_recs if isinstance(r.get("连板数"), (int, float))]
+                snap["zt_pool"] = {
+                    "count": len(zt_recs),
+                    "max_board": max(boards) if boards else None,
+                    "industry_rank": sorted(
+                        [{"industry": k, "count": v} for k, v in industries.items()],
+                        key=lambda x: -x["count"],
+                    )[:10],
+                    "list": zt_recs,
+                }
+                quality["zt_pool"] = "ok"
+            else:
+                snap["zt_pool"] = None
+                quality["zt_pool"] = "empty"
+        except Exception:
+            snap["zt_pool"] = None
+            quality["zt_pool"] = "error"
 
     # 6) 新闻（消息面原始文本，交由 Agent 做语义理解）
-    try:
-        news = get_news(code)
-        snap["news"] = _df_to_records(news, limit=20) if news is not None else []
-        quality["news"] = "ok" if snap["news"] else "empty"
-    except Exception:
-        snap["news"] = []
-        quality["news"] = "error"
+    if "news" in secs:
+        try:
+            news = get_news(code)
+            snap["news"] = _df_to_records(news, limit=20) if news is not None else []
+            quality["news"] = "ok" if snap["news"] else "empty"
+        except Exception:
+            snap["news"] = []
+            quality["news"] = "error"
+    else:
+        snap["news"] = None
 
     # 7) 两融（全市场口径，非个股）
-    try:
-        mg = get_margin()
-        snap["margin"] = _df_to_records(mg, limit=10) if mg is not None and not mg.empty else None
-        quality["margin"] = "ok" if snap["margin"] else "empty"
-    except Exception:
+    if "margin" in secs:
+        try:
+            mg = get_margin()
+            snap["margin"] = _df_to_records(mg, limit=10) if mg is not None and not mg.empty else None
+            quality["margin"] = "ok" if snap["margin"] else "empty"
+        except Exception:
+            snap["margin"] = None
+            quality["margin"] = "error"
+    else:
         snap["margin"] = None
-        quality["margin"] = "error"
 
     # 8) 北向资金
-    time.sleep(0.4)
-    try:
-        nf = get_north_flow()
-        snap["north_flow"] = _df_to_records(nf, limit=10) if nf is not None and not nf.empty else None
-        quality["north_flow"] = "ok" if snap["north_flow"] else "empty"
-    except Exception:
+    if "north_flow" in secs:
+        time.sleep(0.4)
+        try:
+            nf = get_north_flow()
+            snap["north_flow"] = _df_to_records(nf, limit=10) if nf is not None and not nf.empty else None
+            quality["north_flow"] = "ok" if snap["north_flow"] else "empty"
+        except Exception:
+            snap["north_flow"] = None
+            quality["north_flow"] = "error"
+    else:
         snap["north_flow"] = None
-        quality["north_flow"] = "error"
 
     # 9) 解禁（未来60天，该股无解禁时为空列表）
-    time.sleep(0.4)
-    try:
-        ul = get_unlock(code)
-        snap["unlock"] = _df_to_records(ul, limit=20) if ul is not None and not ul.empty else []
-        quality["unlock"] = "ok" if snap["unlock"] else "none"
-    except Exception:
-        snap["unlock"] = []
-        quality["unlock"] = "error"
-    except Exception:
+    if "unlock" in secs:
+        time.sleep(0.4)
+        try:
+            ul = get_unlock(code)
+            snap["unlock"] = _df_to_records(ul, limit=20) if ul is not None and not ul.empty else []
+            quality["unlock"] = "ok" if snap["unlock"] else "none"
+        except Exception:
+            snap["unlock"] = []
+            quality["unlock"] = "error"
+    else:
         snap["unlock"] = None
-        quality["unlock"] = "error"
 
     # 10) 股票名称（从新闻/资金流里取不到时留空，Agent 可用代码检索）
     snap["data_quality"] = quality
     return _clean(snap)
 
 
-def get_snapshot_json(symbol, days=120):
-    """get_snapshot 的纯 JSON 版本（供前端侧边栏 function-call 使用）。"""
-    return get_snapshot(symbol, days=days)
+def get_snapshot_json(symbol, days=120, sections=None):
+    """get_snapshot 的纯 JSON 版本（供前端侧边栏 function-call 使用）。
+
+    并发保护：本函数在 gateway 事件循环中同步执行，单次约 10s。若前端连点两只
+    股票，第二个请求会阻塞整个网关（表现为"网关卡死"）。因此用进程内锁串行化：
+    已有快照在构建时，后来者**立即**返回 busy 标记（绝不等待），由前端稍后重试，
+    避免第二个请求再次长时间独占事件循环。
+    """
+    if not _snapshot_lock.acquire(blocking=False):
+        return {
+            "success": False,
+            "busy": True,
+            "error": "数据正在加载中，请稍后重试",
+            "symbol": norm_symbol(symbol),
+        }
+    try:
+        return get_snapshot(symbol, days=days, sections=sections)
+    finally:
+        _snapshot_lock.release()
 
 
 # ---------------------------------------------------------------------------
