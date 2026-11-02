@@ -188,6 +188,17 @@ DIM_FUNCS = {
     "intraday": _dim_intraday,
 }
 
+# 各维度所需的快照数据块（传给 api.get_snapshot 的 sections），
+# 避免只取一个维度却把九大数据源全部拉一遍（耗时从 ~10s 降到 1~2s）。
+DIM_SECTIONS = {
+    "tech": ["kline"],
+    "fund": ["fund"],
+    "sentiment": ["zt_pool"],
+    "market": ["index"],
+    "news": ["news"],
+    "intraday": ["kline", "intraday"],
+}
+
 
 class StockAnalyzeTool:
     name = "stock_analyze"
@@ -226,9 +237,21 @@ class StockAnalyzeTool:
                     "stderr": f"不支持的维度 {raw_dim}，可选：{', '.join(DIM_FUNCS.keys())}",
                 }
 
-            snap = api.get_snapshot(symbol, days=120)
+            # 只拉取所需维度的数据块，避免单维度查询也触发全量九源抓取
+            if dim:
+                sections = DIM_SECTIONS.get(dim)
+            else:
+                sections = None
+            snap = api.get_snapshot(symbol, days=120, sections=sections)
             code = snap.get("code") or api.norm_symbol(symbol)
-            if not snap.get("kline") and not snap.get("intraday"):
+            # 仅当"所取维度全部无数据"时才判定失败（单维度查询不会拉 kline，
+            # 不能再用 kline/intraday 作为唯一有效性判据）
+            if sections is None:
+                has_data = bool(snap.get("kline") or snap.get("intraday"))
+            else:
+                # sections 里可能有别名（如 fund → fund_flow/north_flow），需归一化后再查
+                has_data = any(snap.get(k) for k in api._resolve_sections(sections))
+            if not has_data:
                 return {"success": False, "stdout": "", "stderr": f"未获取到 {code} 的数据（代码可能有误或已退市）"}
 
             dims = [dim] if dim else list(DIM_FUNCS.keys())
