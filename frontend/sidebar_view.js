@@ -128,6 +128,7 @@ export default {
       showNews: true,
       showMacro: false,
       showZt: false,
+      showCyq: true,
       sending: false,
     };
   },
@@ -153,6 +154,10 @@ export default {
     },
     ind() {
       return (this.snap && this.snap.indicators) || null;
+    },
+    cyq() {
+      const c = (this.snap && this.snap.cyq) || [];
+      return Array.isArray(c) && c.length > 0 ? c : null;
     },
     kline() {
       const k = (this.snap && this.snap.kline) || [];
@@ -431,6 +436,33 @@ export default {
             "，量比 " + this.fmt(ind.vol_ratio) +
             "，换手 " + this.pct(ind.turnover) +
             "，ATR14 " + this.fmt(ind.atr14),
+        );
+        if (ind.cyc13 != null || ind.cyf != null || ind.profit_ratio != null) {
+          lines.push(
+            "筹码类指标：CYC5 " + this.fmt(ind.cyc5) + " / CYC13 " + this.fmt(ind.cyc13) +
+              " / CYC34 " + this.fmt(ind.cyc34) + " / CYC∞ " + this.fmt(ind.cyc_inf) +
+              "，CYS13 " + this.pct(ind.cys13) +
+              "，CYF " + this.fmt(ind.cyf, 1) +
+              "，CYR " + this.pct(ind.cyr, 3) +
+              "，获利盘比例 " + this.pct(ind.profit_ratio != null ? ind.profit_ratio * 100 : null) +
+              "，CYD " + this.fmt(ind.cyd, 4) +
+              "，CYDD " + this.fmt(ind.cydd, 1) +
+              "，CYMR " + this.pct(ind.cymr) +
+              "，CYQK " + this.fmt(ind.cyqk, 2) +
+              "，CYQKR " + this.fmt(ind.cyqkr, 2),
+          );
+        }
+      }
+      if (this.cyq) {
+        const c = this.cyq[this.cyq.length - 1];
+        lines.push(
+          "筹码分布（" + String(c["日期"] || "").slice(0, 10) + "）：获利比例 " +
+            this.pct(c["获利比例"] != null ? c["获利比例"] * 100 : null) +
+            "，平均成本 " + this.fmt(c["平均成本"]) +
+            "，90%成本 " + this.fmt(c["90成本-低"]) + "~" + this.fmt(c["90成本-高"]) +
+            "（集中度 " + this.pct(c["90集中度"]) + "）" +
+            "，70%成本 " + this.fmt(c["70成本-低"]) + "~" + this.fmt(c["70成本-高"]) +
+            "（集中度 " + this.pct(c["70集中度"]) + "）",
         );
       }
       const ff = this.fundFlow.slice(0, 5);
@@ -876,6 +908,98 @@ export default {
             <span style="font-size:12px;color:#ddd;">{{ fmt(ind.atr14) }}</span>
           </div>
         </div>
+        <!-- 筹码类指标（CY* 家族） -->
+        <div v-if="ind.cyc13 != null || ind.cyf != null || ind.profit_ratio != null"
+          style="display:flex;flex-wrap:wrap;gap:8px 14px;padding-top:6px;border-top:1px solid #2a2a2a;">
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">CYC 5/13/34/∞</span>
+            <span style="font-size:12px;color:#ddd;">
+              {{ fmt(ind.cyc5) }} / {{ fmt(ind.cyc13) }} / {{ fmt(ind.cyc34) }} / {{ fmt(ind.cyc_inf) }}
+            </span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">CYS13 短线盈亏</span>
+            <span style="font-size:12px;" :style="{ color: chgColor(ind.cys13) }">{{ pct(ind.cys13) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">CYF 市场能量</span>
+            <span style="font-size:12px;color:#ddd;">{{ fmt(ind.cyf, 1) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">CYR 市场强弱</span>
+            <span style="font-size:12px;" :style="{ color: chgColor(ind.cyr) }">{{ pct(ind.cyr, 3) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">获利盘比例</span>
+            <span style="font-size:12px;color:#ddd;">{{ pct(ind.profit_ratio != null ? ind.profit_ratio * 100 : null) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">CYD 承接</span>
+            <span style="font-size:12px;color:#ddd;">{{ fmt(ind.cyd, 4) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">CYDD 动态承接</span>
+            <span style="font-size:12px;color:#ddd;">{{ fmt(ind.cydd, 1) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">CYMR 承接率</span>
+            <span style="font-size:12px;color:#ddd;">{{ pct(ind.cymr) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">CYQK 博弈K线</span>
+            <span style="font-size:12px;color:#ddd;">{{ fmt(ind.cyqk, 2) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">CYQKR 博弈趋势</span>
+            <span style="font-size:12px;color:#ddd;">{{ fmt(ind.cyqkr, 2) }}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 筹码分布（CYQ） -->
+      <div v-if="cyq"
+        style="background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:6px;">
+        <div style="display:flex;align-items:center;gap:8px;cursor:pointer;" @click="showCyq = !showCyq">
+          <span style="font-size:12px;color:#aaa;font-weight:600;">筹码分布 CYQ</span>
+          <span style="font-size:10px;color:#666;">{{ String(cyq[cyq.length - 1]['日期'] || '').slice(0, 10) }}</span>
+          <span style="flex:1;"></span>
+          <span style="font-size:10px;color:#666;">{{ showCyq ? '收起' : '展开' }}</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px 14px;">
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">获利比例</span>
+            <span style="font-size:13px;font-weight:600;color:#ddd;">{{ pct(cyq[cyq.length - 1]['获利比例'] != null ? cyq[cyq.length - 1]['获利比例'] * 100 : null) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">平均成本</span>
+            <span style="font-size:13px;color:#ddd;">{{ fmt(cyq[cyq.length - 1]['平均成本']) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">90%成本区间</span>
+            <span style="font-size:12px;color:#ddd;">{{ fmt(cyq[cyq.length - 1]['90成本-低']) }} ~ {{ fmt(cyq[cyq.length - 1]['90成本-高']) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">90%集中度</span>
+            <span style="font-size:12px;color:#ddd;">{{ pct(cyq[cyq.length - 1]['90集中度']) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">70%成本区间</span>
+            <span style="font-size:12px;color:#ddd;">{{ fmt(cyq[cyq.length - 1]['70成本-低']) }} ~ {{ fmt(cyq[cyq.length - 1]['70成本-高']) }}</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:1px;">
+            <span style="font-size:10px;color:#888;">70%集中度</span>
+            <span style="font-size:12px;color:#ddd;">{{ pct(cyq[cyq.length - 1]['70集中度']) }}</span>
+          </div>
+        </div>
+        <template v-if="showCyq">
+          <div style="font-size:11px;color:#888;margin-top:2px;">近10日获利比例</div>
+          <div style="display:flex;flex-wrap:wrap;gap:5px;">
+            <span v-for="(r, i) in cyq.slice(-10)" :key="i"
+              style="padding:1px 7px;background:#252526;border:1px solid #3c3c3c;border-radius:9px;font-size:10px;color:#ddd;">
+              {{ String(r['日期'] || '').slice(5, 10) }} {{ pct(r['获利比例'] != null ? r['获利比例'] * 100 : null) }}
+            </span>
+          </div>
+        </template>
       </div>
 
       <!-- K线 -->

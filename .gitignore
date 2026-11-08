@@ -8,3 +8,7 @@ dist/
 # 测试/临时
 *.log
 .DS_Store
+
+# Reversa
+.reversa/config.user.toml
+_reversa_sdd/

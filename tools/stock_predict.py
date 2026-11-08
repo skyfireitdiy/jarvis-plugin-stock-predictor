@@ -10,12 +10,15 @@ stock_predict 工具：A股多维度原始数据快照（供 Agent 自行分析�
 返回内容（结构化文本，便于 Agent 阅读理解）：
   1. 交易时段状态（盘中/午休/盘前/收盘），盘中额外给出实时快照
   2. 日K + 技术指标（MA/MACD/RSI/BOLL/量比/换手/ATR）
-  3. 个股主力资金流（近10日）
-  4. 市场情绪（涨停池家数/最高连板/行业分布）
-  5. 大盘环境（上证近60日）
-  6. 消息面新闻原文（交由 Agent 做语义理解）
-  7. 两融余额、北向资金、限售解禁
-  8. 数据可用性清单（哪项缺失，Agent 据此判断可信度）
+  3. 筹码类指标（CYC成本均线/CYS短线盈亏/CYF市场能量/CYR市场强弱/CYD承接/
+     CYDD动态承接/CYMR筹码承接率/CYQK博弈K线/CYQKR博弈趋势）
+  4. 筹码分布（CYQ：获利比例/平均成本/90与70成本区间及集中度）
+  5. 个股主力资金流（近10日）
+  6. 市场情绪（涨停池家数/最高连板/行业分布）
+  7. 大盘环境（上证近60日）
+  8. 消息面新闻原文（交由 Agent 做语义理解）
+  9. 两融余额、北向资金、限售解禁
+  10. 数据可用性清单（哪项缺失，Agent 据此判断可信度）
 """
 import os
 
@@ -97,6 +100,53 @@ def _fmt_indicators(ind):
         f"  量比 {_f(ind.get('vol_ratio'))}  换手率 {_f(ind.get('turnover'), 2, '%')}  "
         f"5日均换手 {_f(ind.get('turnover_ma5'), 2, '%')}  ATR14 {_f(ind.get('atr14'))}"
     )
+    # 筹码类指标（CY* 家族，基于成本均线与获利盘；仅当数据层算出时展示）
+    cy = {
+        "CYC5": ind.get("cyc5"), "CYC13": ind.get("cyc13"), "CYC34": ind.get("cyc34"),
+        "CYC∞": ind.get("cyc_inf"),
+    }
+    if any(v is not None for v in cy.values()):
+        lines.append(
+            "  CYC成本均线  " + "  ".join(f"{k} {_f(v)}" for k, v in cy.items())
+        )
+    lines.append(
+        f"  CYS13(短线盈亏) {_f(ind.get('cys13'), 2, '%')}  "
+        f"CYR(市场强弱) {_f(ind.get('cyr'), 3, '%')}  "
+        f"CYF(市场能量) {_f(ind.get('cyf'), 1)}  "
+        f"获利盘比例 {_f(ind.get('profit_ratio') * 100 if isinstance(ind.get('profit_ratio'), (int, float)) else None, 1, '%')}"
+    )
+    lines.append(
+        f"  CYD(承接) {_f(ind.get('cyd'), 4)}  CYDD(动态承接) {_f(ind.get('cydd'), 1)}  "
+        f"CYMR(筹码承接率) {_f(ind.get('cymr'), 2, '%')}"
+    )
+    lines.append(
+        f"  CYQK(博弈K线) {_f(ind.get('cyqk'), 2)}  CYQKR(博弈趋势) {_f(ind.get('cyqkr'), 2)}"
+    )
+    return lines
+
+
+def _fmt_cyq(cyq):
+    lines = ["", "【筹码分布（CYQ，东财源）】"]
+    if not cyq:
+        lines.append("  筹码分布数据不可用（数据源限流或接口异常）。")
+        return lines
+    last = cyq[-1]
+    lines.append(
+        f"  最新 {last.get('日期')}  获利比例 {_f(last.get('获利比例') * 100 if isinstance(last.get('获利比例'), (int, float)) else None, 1, '%')}  "
+        f"平均成本 {_f(last.get('平均成本'))}"
+    )
+    lines.append(
+        f"  90%成本区间 {_f(last.get('90成本-低'))} ~ {_f(last.get('90成本-高'))}  "
+        f"集中度 {_f(last.get('90集中度'), 2, '%')}"
+    )
+    lines.append(
+        f"  70%成本区间 {_f(last.get('70成本-低'))} ~ {_f(last.get('70成本-高'))}  "
+        f"集中度 {_f(last.get('70集中度'), 2, '%')}"
+    )
+    lines.append("  近10日获利比例：" + "  ".join(
+        _f(r.get("获利比例") * 100 if isinstance(r.get("获利比例"), (int, float)) else None, 1, "%")
+        for r in cyq[-10:]
+    ))
     return lines
 
 
@@ -235,8 +285,10 @@ class StockPredictTool:
     description = (
         "获取A股某只股票的完整原始数据快照，供你（Agent）自行做多维度分析。"
         "返回：交易时段状态、盘中实时快照（现价/均价/日内位置/盘中量比/30分钟动量）、"
-        "日K+技术指标（MA/MACD/RSI/BOLL/量比/换手/ATR）、个股主力资金流、"
-        "涨停池情绪、大盘环境、新闻原文、两融/北向/解禁、数据可用性清单。"
+        "日K+技术指标（MA/MACD/RSI/BOLL/量比/换手/ATR）、筹码类指标"
+        "（CYC成本均线/CYS13/CYF/CYR/CYD/CYDD/CYMR/CYQK/CYQKR）、筹码分布CYQ"
+        "（获利比例/平均成本/成本区间/集中度）、个股主力资金流、涨停池情绪、"
+        "大盘环境、新闻原文、两融/北向/解禁、数据可用性清单。"
         "**本工具不输出任何预测结论**——方向、涨跌幅区间、置信度需你基于这些数据自行研判，"
         "并明确标注盘中/非盘中口径差异与数据缺失情况。输入为股票代码（如 600519）。"
     )
@@ -283,6 +335,7 @@ class StockPredictTool:
             lines += _fmt_intraday(snap.get("intraday"))
             lines += _fmt_indicators(snap.get("indicators"))
             lines += _fmt_kline(snap.get("kline"), n=10)
+            lines += _fmt_cyq(snap.get("cyq"))
             lines += _fmt_fund_flow(snap.get("fund_flow"))
             lines += _fmt_zt(snap.get("zt_pool"))
             lines += _fmt_index(snap.get("index"))

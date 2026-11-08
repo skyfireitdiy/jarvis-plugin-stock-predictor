@@ -3,11 +3,12 @@ id: stock-predictor
 name: A股个股数据
 description: >-
   为 Agent 提供 A 股个股的完整原始数据快照：日K与技术指标（MA/MACD/RSI/BOLL/ATR/量比/换手）、
+  筹码类指标（CYC成本均线/CYS13/CYF/CYR/CYD/CYDD/CYMR/CYQK/CYQKR）与筹码分布CYQ（获利比例/成本区间/集中度）、
   盘中实时走势（现价/VWAP/日内位置/盘中量比/30分钟动量，仅交易时段提供）、
   主力资金流、涨停池情绪、上证指数环境、两融余额、北向资金、解禁信息与个股新闻。
   插件本身不做打分、不预测方向，分析结论由 Agent 基于这些数据自行给出。
   支持对话问答、侧边栏数据面板（一键让 Agent 分析）与定时盘后日报。
-version: 0.2.5
+version: 0.2.6
 license: MIT
 logo: >-
   <svg viewBox="0 0 16 16" fill="none" stroke="#ef4444" stroke-width="1.5"
@@ -39,8 +40,12 @@ capabilities:
     description: "交易时段提供实时价、VWAP、日内位置、盘中量比、30分钟动量、振幅；非交易时段自动跳过网络请求"
   - name: "技术指标计算"
     description: "计算 MA5/10/20/60、MACD、RSI14、BOLL、ATR14、量比、换手率等客观指标，不做任何方向判断"
+  - name: "筹码类指标计算"
+    description: "基于成本均线与获利盘计算 CYC5/13/34/∞、CYS13、CYR、CYF、CYD、CYDD、CYMR、CYQK、CYQKR 等客观指标（CYF/CYD/CYDD/CYMR/CYQK 为近似口径），不做任何方向判断"
+  - name: "筹码分布查询"
+    description: "获取东财源筹码分布 CYQ：获利比例、平均成本、90%/70%成本区间及集中度"
   - name: "单维度数据"
-    description: "按技术面/资金面/情绪面/大盘/消息面单独返回某一维度的原始数据"
+    description: "按技术面/资金面/情绪面/大盘/消息面单独返回某一维度的原始数据（技术面含筹码类指标与筹码分布）"
   - name: "批量数据摘要"
     description: "对关注列表批量拉取数据摘要，供盘后复盘或定时任务使用（不调 LLM，零成本）"
   - name: "侧边栏数据面板"

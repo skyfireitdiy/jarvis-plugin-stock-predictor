@@ -6,7 +6,7 @@ stock_analyze 工具：A股单维度原始数据（供 Agent 按维度聚焦分�
 一部分数据，减少 token 消耗。**同样只给数据，不给结论。**
 
 维度：
-  tech      技术面：日K + MA/MACD/RSI/BOLL/量比/换手/ATR
+  tech      技术面：日K + MA/MACD/RSI/BOLL/量比/换手/ATR + 筹码类指标(CYC/CYS/CYF/CYR/CYD/CYDD/CYMR/CYQK/CYQKR) + 筹码分布CYQ
   fund      资金面：个股主力资金流（近10日）+ 北向资金
   sentiment 情绪面：涨停池家数/最高连板/行业分布/高标个股
   market    大盘：上证指数近60日走势
@@ -64,6 +64,36 @@ def _dim_tech(code, snap):
     lines.append(f"  MACD: DIF {_f(ind.get('dif'), 4)}  DEA {_f(ind.get('dea'), 4)}  柱 {_f(ind.get('macd'), 4)}")
     lines.append(f"  RSI14 {_f(ind.get('rsi14'))}  BOLL 上 {_f(ind.get('boll_up'))} / 中 {_f(ind.get('boll_mid'))} / 下 {_f(ind.get('boll_low'))}")
     lines.append(f"  量比 {_f(ind.get('vol_ratio'))}  换手 {_f(ind.get('turnover'), 2, '%')}  5日均换手 {_f(ind.get('turnover_ma5'), 2, '%')}  ATR14 {_f(ind.get('atr14'))}")
+    # 筹码类指标（CY* 家族）
+    cy = {
+        "CYC5": ind.get("cyc5"), "CYC13": ind.get("cyc13"), "CYC34": ind.get("cyc34"),
+        "CYC∞": ind.get("cyc_inf"),
+    }
+    if any(v is not None for v in cy.values()):
+        lines.append("  CYC成本均线  " + "  ".join(f"{k} {_f(v)}" for k, v in cy.items()))
+    lines.append(
+        f"  CYS13(短线盈亏) {_f(ind.get('cys13'), 2, '%')}  "
+        f"CYR(市场强弱) {_f(ind.get('cyr'), 3, '%')}  "
+        f"CYF(市场能量) {_f(ind.get('cyf'), 1)}  "
+        f"获利盘比例 {_f(ind.get('profit_ratio') * 100 if isinstance(ind.get('profit_ratio'), (int, float)) else None, 1, '%')}"
+    )
+    lines.append(
+        f"  CYD(承接) {_f(ind.get('cyd'), 4)}  CYDD(动态承接) {_f(ind.get('cydd'), 1)}  "
+        f"CYMR(筹码承接率) {_f(ind.get('cymr'), 2, '%')}"
+    )
+    lines.append(
+        f"  CYQK(博弈K线) {_f(ind.get('cyqk'), 2)}  CYQKR(博弈趋势) {_f(ind.get('cyqkr'), 2)}"
+    )
+    cyq = snap.get("cyq")
+    if cyq:
+        last = cyq[-1]
+        lines.append(
+            f"  筹码分布CYQ {last.get('日期')}：获利比例 "
+            f"{_f(last.get('获利比例') * 100 if isinstance(last.get('获利比例'), (int, float)) else None, 1, '%')}  "
+            f"平均成本 {_f(last.get('平均成本'))}  "
+            f"90%成本 {_f(last.get('90成本-低'))}~{_f(last.get('90成本-高'))}  "
+            f"集中度 {_f(last.get('90集中度'), 2, '%')}"
+        )
     if kline:
         lines.append("  近10日K线：")
         lines.append("    日期        开      高      低      收      涨跌%   量比   换手%")
@@ -191,7 +221,7 @@ DIM_FUNCS = {
 # 各维度所需的快照数据块（传给 api.get_snapshot 的 sections），
 # 避免只取一个维度却把九大数据源全部拉一遍（耗时从 ~10s 降到 1~2s）。
 DIM_SECTIONS = {
-    "tech": ["kline"],
+    "tech": ["kline", "cyq"],
     "fund": ["fund"],
     "sentiment": ["zt_pool"],
     "market": ["index"],
@@ -204,7 +234,8 @@ class StockAnalyzeTool:
     name = "stock_analyze"
     description = (
         "按维度获取A股某只股票的原始数据，供你（Agent）聚焦分析某一面。"
-        "维度：tech(技术面)/fund(资金面)/sentiment(情绪面)/market(大盘)/news(消息面)/intraday(盘中实时)，"
+        "维度：tech(技术面，含筹码类指标CYC/CYS/CYF/CYR/CYD/CYDD/CYMR/CYQK/CYQKR与筹码分布CYQ)"
+        "/fund(资金面)/sentiment(情绪面)/market(大盘)/news(消息面)/intraday(盘中实时)，"
         "不传 dimension 则返回全部维度。**只返回客观数据，不含任何预测结论**。"
     )
     parameters = {

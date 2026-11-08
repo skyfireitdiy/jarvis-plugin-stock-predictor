@@ -84,10 +84,14 @@ _snapshot_lock = threading.Lock()
 # 快照分块与依赖关系（供 get_snapshot 按需取数，避免只取一个维度却拉全部数据）
 SNAPSHOT_SECTIONS = (
     "kline", "intraday", "fund_flow", "index", "zt_pool",
-    "news", "margin", "north_flow", "unlock",
+    "news", "margin", "north_flow", "unlock", "cyq",
 )
-# 各分块依赖的其它分块（如资金面需要北向资金）
-SECTION_DEPS = {"fund": ("fund_flow", "north_flow")}
+# 各分块依赖的其它分块（如资金面需要北向资金；筹码分布依赖日K）
+SECTION_DEPS = {
+    "fund": ("fund_flow", "north_flow"),
+    "cyq": ("kline", "cyq"),
+    "chips": ("kline", "cyq"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +549,9 @@ def get_kline(symbol, days=120):
             })
             df = df[["date", "open", "close", "high", "low", "volume", "amount", "turnover"]]
             df["turnover"] = pd.to_numeric(df["turnover"], errors="coerce")
+            # 东财源"成交量"单位为"手"（1手=100股），统一转为"股"，
+            # 与新浪源口径一致，保证 CYC=成交额/成交量 的成本均线数值正确。
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce") * 100
             _kline_cache["data"][code] = {"df": df, "ts": now}
             return df.tail(days).reset_index(drop=True)
     except Exception:  # noqa: BLE001
@@ -808,6 +815,139 @@ def _compute_atr(df, n=14):
 
 
 # ---------------------------------------------------------------------------
+# 筹码分布（CYQ）与 CY* 成本/筹码类指标
+# ---------------------------------------------------------------------------
+# 说明：CYC/CYS/CYF/CYR/CYD/CYDD/CYMR/CYQK/CYQKR 等指标源自指南针/同花顺的
+# "成本-筹码"理论体系，均建立在 CYQ（筹码分布/获利盘）之上。本模块只做
+# 纯数学计算，不做任何判断与预测。口径说明：
+#   CYC(N)  = 近 N 日成交额之和 / 近 N 日成交量之和（成交量加权成本均线）
+#   CYS(N)  = (收盘价 - CYC(N)) / CYC(N) * 100，即价格对成本均线的乖离
+#   CYR     = 13 日成本均线当日较昨日的升降幅度（%）
+#   CYF     = 市场能量（0-100 人气指标），用获利盘比例与换手率加权近似
+#   CYD     = 收盘获利盘 / 每股成交量（承接因子）
+#   CYDD    = 收盘获利盘 / 换手率（动态承接因子）
+#   CYMR    = (今获利盘 - 昨获利盘) / (今换手 - 昨换手)（筹码承接率）
+#   CYQK    = 收盘获利盘 - 开盘获利盘（博弈K线长度，开盘获利盘用昨收近似）
+#   CYQKR   = CYQK 的 N 日均值（博弈趋势）
+# 获利盘比例（0~1）来自 akshare stock_cyq_em 的"获利比例"列。
+_cyq_cache = {"data": {}, "ts": {}}  # code -> DataFrame, TTL 30min
+
+
+def get_cyq(symbol):
+    """获取 A 股筹码分布（CYQ）原始数据（东财源 stock_cyq_em）。
+
+    返回列：日期 / 获利比例(0~1) / 平均成本 / 90成本-低 / 90成本-高 / 90集中度 /
+            70成本-低 / 70成本-高 / 70集中度。
+    带模块级缓存（TTL 30min），失败返回空 DataFrame，不抛异常。
+    """
+    if ak is None:
+        return pd.DataFrame()
+    code = norm_symbol(symbol)
+    now = time.time()
+    if code in _cyq_cache["data"] and now - _cyq_cache["ts"].get(code, 0) < 30 * 60:
+        return _cyq_cache["data"][code]
+    try:
+        df = with_retry(1, 0.5)(ak.stock_cyq_em)(symbol=code, adjust="")
+        if df is not None and not df.empty:
+            df = df.copy()
+            # 统一日期列为字符串，数值列转 float
+            if "日期" in df.columns:
+                df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+            for c in df.columns:
+                if c != "日期":
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            _cyq_cache["data"][code] = df
+            _cyq_cache["ts"][code] = now
+            return df
+    except Exception:  # noqa: BLE001
+        pass
+    return pd.DataFrame()
+
+
+def _calc_cy_indicators(df, cyq_df):
+    """在日K基础上追加 CY* 成本/筹码类指标列（纯数学，不含判断）。
+
+    df: 已含 open/close/high/low/volume/amount/turnover 的日K DataFrame
+    cyq_df: akshare stock_cyq_em 返回的筹码分布 DataFrame（按日期升序）
+    返回：df 的副本，追加 cyc5/cyc13/cyc34/cyc_inf/cys13/cyr/cyf/cyd/cydd/
+          cymr/cyqk/cyqkr 列（无数据处为 NaN）。
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in ("open", "close", "high", "low", "volume", "amount"):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    if "turnover" not in out.columns:
+        out["turnover"] = np.nan
+    else:
+        out["turnover"] = pd.to_numeric(out["turnover"], errors="coerce")
+
+    # --- CYC 成本均线（成交量加权）：CYC(N) = Σ成交额 / Σ成交量 ---
+    amt = out["amount"].fillna(0)
+    vol = out["volume"].fillna(0)
+    for n in (5, 13, 34):
+        amt_sum = amt.rolling(n).sum()
+        vol_sum = vol.rolling(n).sum()
+        out[f"cyc{n}"] = (amt_sum / vol_sum.replace(0, np.nan)).round(2)
+    # CYC∞：全部样本的累计成交额/累计成交量
+    out["cyc_inf"] = (amt.cumsum() / vol.cumsum().replace(0, np.nan)).round(2)
+
+    # --- CYS13 短线盈亏（价格对 13 日成本均线乖离，%）---
+    out["cys13"] = ((out["close"] - out["cyc13"]) / out["cyc13"].replace(0, np.nan) * 100).round(2)
+
+    # --- CYR 市场强弱：13 日成本均线当日较昨日升降幅度（%）---
+    out["cyr"] = (out["cyc13"] / out["cyc13"].shift(1) - 1).replace([np.inf, -np.inf], np.nan) * 100
+    out["cyr"] = out["cyr"].round(3)
+
+    # --- 获利盘比例：按日期对齐 cyq_df 的"获利比例"列 ---
+    profit = pd.Series(np.nan, index=out.index)
+    if cyq_df is not None and not cyq_df.empty and "日期" in cyq_df.columns and "获利比例" in cyq_df.columns:
+        cyq_map = {}
+        for _, r in cyq_df.iterrows():
+            d = str(r.get("日期", ""))[:10]
+            if d:
+                cyq_map[d] = r.get("获利比例")
+        if "date" in out.columns:
+            out_dates = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            profit = out_dates.map(lambda d: cyq_map.get(str(d), np.nan))
+    out["profit_ratio"] = pd.to_numeric(profit, errors="coerce")
+
+    # --- CYF 市场能量（0-100）：获利盘比例与换手率的加权人气近似 ---
+    # 参考指南针"市场能量"思想：多头能量与成交量/换手相关，数值 0-100。
+    # 这里用 获利盘比例*100 与换手率的加权平滑近似（无神经网络，纯数据近似）。
+    pr = out["profit_ratio"].clip(lower=0, upper=1)
+    tr_ratio = (out["turnover"] / 100.0).clip(lower=0, upper=1)
+    # 当日能量：获利盘越高、换手越活跃 → 能量越高
+    cyf_raw = (pr * 0.7 + tr_ratio * 0.3) * 100
+    out["cyf"] = cyf_raw.ewm(span=5, adjust=False).mean().round(1)
+
+    # --- CYD 承接因子：收盘获利盘 / 每股成交量 ---
+    # 每股成交量 = 成交量 / 流通股本（近似用 成交量 归一化，避免量纲差异）。
+    # 为可比较，用 获利盘比例 / (成交量 / 1e6) 的比值，量纲统一为 比例/百万股。
+    per_vol = (out["volume"] / 1e6).replace(0, np.nan)
+    out["cyd"] = (out["profit_ratio"] / per_vol).round(6)
+
+    # --- CYDD 动态承接因子：收盘获利盘 / 换手率（%）---
+    out["cydd"] = (out["profit_ratio"] / out["turnover"].replace(0, np.nan) * 100).round(4)
+
+    # --- CYMR 筹码承接率：(今获利盘 - 昨获利盘) / (今换手 - 昨换手) ---
+    d_profit = out["profit_ratio"].diff()
+    d_turn = out["turnover"].diff()
+    out["cymr"] = (d_profit / d_turn.replace(0, np.nan) * 100).round(6)
+
+    # --- CYQK 博弈K线长度：收盘获利盘 - 开盘获利盘（开盘用昨收近似）---
+    # 精确口径需开盘价对应的获利盘（需筹码分布直方图），此处用"当日获利盘相对
+    # 前一日获利盘的变化"近似博弈K线长度，反映当日筹码获利状态的变化方向。
+    out["cyqk"] = (out["profit_ratio"].diff() * 100).round(4)
+
+    # --- CYQKR 博弈趋势：CYQK 的 5 日均值 ---
+    out["cyqkr"] = out["cyqk"].rolling(5).mean().round(4)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 数据汇总层：get_snapshot —— 一次取齐 Agent 分析所需的全部原始数据
 # ---------------------------------------------------------------------------
 def _df_to_records(df, limit=None, date_col=None):
@@ -919,20 +1059,30 @@ def get_snapshot(symbol, days=120, sections=None):
     }
     snap["name"] = _get_stock_name(code)
 
-    # 1) 日K + 技术指标
+    # 1) 日K + 技术指标（含 CY* 成本/筹码指标）
     df = None
+    cyq_df = None
     if "kline" in secs:
         try:
             df = get_kline(code, days=days)
             quality["kline"] = "ok" if (df is not None and not df.empty) else "empty"
         except Exception:
             quality["kline"] = "error"
+    # 筹码分布（CYQ）——供 CY* 指标计算与独立展示；仅当需要 kline 或 cyq 时拉取
+    if "cyq" in secs and df is not None and not df.empty:
+        try:
+            cyq_df = get_cyq(code)
+            quality["cyq"] = "ok" if (cyq_df is not None and not cyq_df.empty) else "empty"
+        except Exception:
+            quality["cyq"] = "error"
     if "kline" not in secs:
         snap["kline"] = None
         snap["indicators"] = None
     elif df is not None and not df.empty:
         try:
             ind_df = _calc_indicators(df)
+            # CY* 成本/筹码指标（依赖日K + 筹码分布获利盘）
+            ind_df = _calc_cy_indicators(ind_df, cyq_df)
             # kline 带上指标列，Agent 可自行判断形态（如 MA 多头排列、MACD 金叉位置）
             snap["kline"] = _df_to_records(ind_df, limit=days)
             last = _last_row(ind_df)
@@ -951,6 +1101,16 @@ def get_snapshot(symbol, days=120, sections=None):
         snap["kline"] = []
         snap["indicators"] = None
         quality.setdefault("indicators", "empty")
+
+    # 1b) 筹码分布（CYQ）独立数据块
+    if "cyq" not in secs:
+        snap["cyq"] = None
+    elif cyq_df is not None and not cyq_df.empty:
+        snap["cyq"] = _df_to_records(cyq_df, limit=30)
+        quality.setdefault("cyq", "ok")
+    else:
+        snap["cyq"] = None
+        quality.setdefault("cyq", "empty")
 
     # 2) 盘中快照
     if "intraday" in secs:
@@ -1118,6 +1278,7 @@ PUBLIC_FUNCTIONS = [
     "get_margin",
     "get_north_flow",
     "get_unlock",
+    "get_cyq",
     "watchlist",
     "get_names",
 ]
