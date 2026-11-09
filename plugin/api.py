@@ -948,6 +948,190 @@ def _calc_cy_indicators(df, cyq_df):
 
 
 # ---------------------------------------------------------------------------
+# 可量化操作建议（advice_signals）——规则化方向信号 + 量化参考值
+# ---------------------------------------------------------------------------
+# 说明：本函数基于现有客观指标（MA/MACD/RSI/BOLL/量比/换手/CY* 成本筹码类）
+# 按**客观规则**计算方向信号（bullish/bearish/neutral）与量化参考值（入场/
+# 止损/目标价/仓位档位/时间窗口），供 Agent 据此生成操作建议。
+# 保持"纯数据"定位：只输出规则化信号与参考值，**不输出买卖结论**。
+# 规则口径见 NLSpec .jarvis/.df/specs/quantified-advice.md 规则表。
+# 任一指标缺失时，依赖该指标的信号字段置 null，不伪造；signal_quality 如实标注。
+# 纯内存计算（基于已拉取的 kline/indicators），不新增网络请求。
+_ADVICE_TIMEFRAMES = ["T+1", "T+5", "T+20"]
+
+
+def compute_advice_signals(symbol, kline_df, indicators, cyq_df=None):
+    """基于现有客观指标计算规则化方向信号与量化参考值（纯内存，可单测）。
+
+    参数：
+      symbol:    股票代码（str）
+      kline_df:  已含指标列（ma/macd/rsi/boll/vol_ratio/turnover/cyqk）的日K DataFrame
+      indicators:最新一日指标 dict（含 atr14）
+      cyq_df:    筹码分布 DataFrame（可空；获利盘相关信号已由 cyqk 列承载）
+
+    返回 dict（字段缺失时为 null）：
+      direction / direction_score / entry_ref / stop_loss / targets{t1,t5,t20} /
+      position / position_ratio / timeframe / rules_hit / signal_quality
+
+    错误语义：不抛异常；输入数据不足时返回 signal_quality=insufficient。
+    """
+    empty = {
+        "direction": None,
+        "direction_score": 0.0,
+        "entry_ref": None,
+        "stop_loss": None,
+        "targets": None,
+        "position": None,
+        "position_ratio": None,
+        "timeframe": list(_ADVICE_TIMEFRAMES),
+        "rules_hit": [],
+        "signal_quality": "insufficient",
+    }
+    if kline_df is None or not isinstance(kline_df, pd.DataFrame) or kline_df.empty:
+        return empty
+    last = kline_df.iloc[-1]
+    close = _safe_float(last.get("close"))
+    if close is None:
+        return empty
+
+    rules_hit = []
+    score = 0
+    missing = []
+
+    # --- MA 多空排列：close > MA5 > MA10 > MA20（多头） / 反向（空头） ---
+    ma5, ma10, ma20 = (_safe_float(last.get(f"ma{n}")) for n in (5, 10, 20))
+    if None in (ma5, ma10, ma20):
+        missing.append("ma")
+    elif close > ma5 > ma10 > ma20:
+        rules_hit.append("ma_bullish")
+        score += 20
+    elif close < ma5 < ma10 < ma20:
+        rules_hit.append("ma_bearish")
+        score -= 20
+
+    # --- MACD 金叉/死叉：DIF 上穿/下穿 DEA（用最后两行判断穿越） ---
+    if len(kline_df) >= 2:
+        prev = kline_df.iloc[-2]
+        dif0, dea0 = _safe_float(prev.get("dif")), _safe_float(prev.get("dea"))
+        dif1, dea1 = _safe_float(last.get("dif")), _safe_float(last.get("dea"))
+        if None in (dif0, dea0, dif1, dea1):
+            missing.append("macd")
+        elif dif0 <= dea0 and dif1 > dea1:
+            rules_hit.append("macd_golden_cross")
+            score += 15
+        elif dif0 >= dea0 and dif1 < dea1:
+            rules_hit.append("macd_dead_cross")
+            score -= 15
+
+    # --- RSI14：超卖 <30（偏多）/ 超买 >70（偏空） ---
+    rsi = _safe_float(last.get("rsi14"))
+    if rsi is None:
+        missing.append("rsi")
+    elif rsi < 30:
+        rules_hit.append("rsi_oversold")
+        score += 10
+    elif rsi > 70:
+        rules_hit.append("rsi_overbought")
+        score -= 10
+
+    # --- BOLL：收盘价突破上轨（偏多）/ 跌破下轨（偏空） ---
+    boll_up = _safe_float(last.get("boll_up"))
+    boll_low = _safe_float(last.get("boll_low"))
+    if boll_up is None or boll_low is None:
+        missing.append("boll")
+    else:
+        if close > boll_up:
+            rules_hit.append("boll_break_up")
+            score += 10
+        elif close < boll_low:
+            rules_hit.append("boll_break_down")
+            score -= 10
+
+    # --- 量比/换手：量比>1.5 且换手>5%（放量活跃，偏多）/ 量比<0.7（缩量，偏空） ---
+    vol_ratio = _safe_float(last.get("vol_ratio"))
+    turnover = _safe_float(last.get("turnover"))
+    if vol_ratio is None or turnover is None:
+        missing.append("vol")
+    else:
+        if vol_ratio > 1.5 and turnover > 5:
+            rules_hit.append("vol_expand")
+            score += 10
+        elif vol_ratio < 0.7:
+            rules_hit.append("vol_shrink")
+            score -= 5
+
+    # --- CY* 筹码：获利盘比例上升（CYQK>0，偏多）/ 下降（CYQK<0，偏空） ---
+    cyqk = _safe_float(last.get("cyqk"))
+    if cyqk is None:
+        missing.append("cy")
+    elif cyqk > 0:
+        rules_hit.append("cy_profit_up")
+        score += 10
+    elif cyqk < 0:
+        rules_hit.append("cy_profit_down")
+        score -= 10
+
+    # --- 方向映射：score≥+30 bullish / ≤−30 bearish / 其余 neutral ---
+    score = max(-100, min(100, score))
+    if score >= 30:
+        direction = "bullish"
+    elif score <= -30:
+        direction = "bearish"
+    else:
+        direction = "neutral"
+
+    # --- 仓位映射：bullish→half(0.5)，score≥+50→heavy(0.7)，neutral→light(0.3)，bearish→null ---
+    if direction == "bullish":
+        if score >= 50:
+            position, position_ratio = "heavy", 0.7
+        else:
+            position, position_ratio = "half", 0.5
+    elif direction == "neutral":
+        position, position_ratio = "light", 0.3
+    else:
+        position, position_ratio = None, None
+
+    # --- 量化参考值 ---
+    # 入场参考价 = 现价（最新收盘价）
+    entry_ref = close
+    # 止损价 = 入场价×(1−2*ATR/入场价) 与关键支撑（BOLL下轨/MA20）取更保守者（更低者）
+    # 目标价 = T+N 基于 ATR 推算：T+1=入场+1*ATR，T+5=入场+2*ATR，T+20=入场+3*ATR
+    atr = _safe_float((indicators or {}).get("atr14"))
+    stop_loss = None
+    targets = None
+    if atr is not None and atr > 0:
+        atr_stop = entry_ref - 2 * atr
+        support = None
+        if boll_low is not None:
+            support = boll_low
+        if ma20 is not None:
+            support = ma20 if support is None else min(support, ma20)
+        conservative = atr_stop if support is None else min(atr_stop, support)
+        stop_loss = round(conservative, 2)
+        targets = {
+            "t1": round(entry_ref + 1 * atr, 2),
+            "t5": round(entry_ref + 2 * atr, 2),
+            "t20": round(entry_ref + 3 * atr, 2),
+        }
+    else:
+        missing.append("atr")
+
+    signal_quality = "partial" if missing else "ok"
+    return {
+        "direction": direction,
+        "direction_score": float(score),
+        "entry_ref": entry_ref,
+        "stop_loss": stop_loss,
+        "targets": targets,
+        "position": position,
+        "position_ratio": position_ratio,
+        "timeframe": list(_ADVICE_TIMEFRAMES),
+        "rules_hit": rules_hit,
+        "signal_quality": signal_quality,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 数据汇总层：get_snapshot —— 一次取齐 Agent 分析所需的全部原始数据
 # ---------------------------------------------------------------------------
 def _df_to_records(df, limit=None, date_col=None):
@@ -1078,6 +1262,7 @@ def get_snapshot(symbol, days=120, sections=None):
     if "kline" not in secs:
         snap["kline"] = None
         snap["indicators"] = None
+        snap["advice_signals"] = None
     elif df is not None and not df.empty:
         try:
             ind_df = _calc_indicators(df)
@@ -1093,14 +1278,22 @@ def get_snapshot(symbol, days=120, sections=None):
             latest["atr14"] = _compute_atr(ind_df, 14)
             snap["indicators"] = _clean(latest)
             quality["indicators"] = "ok"
+            # 可量化操作建议（规则化方向信号 + 量化参考值，纯内存计算）
+            advice = compute_advice_signals(code, ind_df, latest, cyq_df)
+            snap["advice_signals"] = _clean(advice)
+            quality["advice_signals"] = advice.get("signal_quality", "insufficient")
         except Exception:
             snap["kline"] = _df_to_records(df, limit=days)
             snap["indicators"] = None
+            snap["advice_signals"] = None
             quality["indicators"] = "error"
+            quality["advice_signals"] = "error"
     else:
         snap["kline"] = []
         snap["indicators"] = None
+        snap["advice_signals"] = None
         quality.setdefault("indicators", "empty")
+        quality["advice_signals"] = "insufficient"
 
     # 1b) 筹码分布（CYQ）独立数据块
     if "cyq" not in secs:

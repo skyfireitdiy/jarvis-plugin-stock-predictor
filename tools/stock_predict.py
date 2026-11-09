@@ -280,6 +280,51 @@ def _fmt_quality(q):
     return lines
 
 
+_DIRECTION_TXT = {
+    "bullish": "偏多",
+    "bearish": "偏空",
+    "neutral": "中性",
+}
+_POSITION_TXT = {
+    "light": "轻仓",
+    "half": "半仓",
+    "heavy": "重仓",
+}
+
+
+def _fmt_advice(adv):
+    """格式化「可量化操作建议」块（markdown 表格 + 免责声明）。
+
+    仅输出规则化方向信号与量化参考值，**不输出买卖结论**；最终判断由 Agent
+    结合新闻/题材/盘口等语义信息给出。
+    """
+    lines = ["", "【可量化操作建议】（规则化信号模板，供参考，非买卖指令）"]
+    if not adv or adv.get("direction") is None:
+        lines.append("  信号数据不足，无法给出量化建议模板。")
+        return lines
+    direction = adv.get("direction")
+    score = adv.get("direction_score")
+    targets = adv.get("targets") or {}
+    pos_txt = _POSITION_TXT.get(adv.get("position"), "观望")
+    pos_ratio = adv.get("position_ratio")
+    ratio_txt = f"{int(pos_ratio * 100)}%" if isinstance(pos_ratio, (int, float)) else "—"
+    rules = "、".join(adv.get("rules_hit") or []) or "无"
+    lines.append("  | 项目 | 值 |")
+    lines.append("  |---|---|")
+    lines.append(f"  | 方向信号 | {_DIRECTION_TXT.get(direction, direction)}（得分 {_f(score, 1)}） |")
+    lines.append(f"  | 入场参考 | {_f(adv.get('entry_ref'))} 元 |")
+    lines.append(f"  | 止损 | {_f(adv.get('stop_loss'))} 元 |")
+    lines.append(
+        f"  | 目标价 | T+1: {_f(targets.get('t1'))} / T+5: {_f(targets.get('t5'))} / T+20: {_f(targets.get('t20'))} |"
+    )
+    lines.append(f"  | 建议仓位 | {pos_txt}（{ratio_txt}） |")
+    lines.append(f"  | 时间窗口 | {'/'.join(adv.get('timeframe') or [])} |")
+    lines.append(f"  | 依据 | {rules} |")
+    lines.append(f"  | 数据充分度 | {adv.get('signal_quality')} |")
+    lines.append("  > ⚠️ 以上为基于客观指标的规则化信号模板，非投资建议，不构成买卖指令。")
+    return lines
+
+
 class StockPredictTool:
     name = "stock_predict"
     description = (
@@ -288,7 +333,8 @@ class StockPredictTool:
         "日K+技术指标（MA/MACD/RSI/BOLL/量比/换手/ATR）、筹码类指标"
         "（CYC成本均线/CYS13/CYF/CYR/CYD/CYDD/CYMR/CYQK/CYQKR）、筹码分布CYQ"
         "（获利比例/平均成本/成本区间/集中度）、个股主力资金流、涨停池情绪、"
-        "大盘环境、新闻原文、两融/北向/解禁、数据可用性清单。"
+        "大盘环境、新闻原文、两融/北向/解禁、可量化操作建议（规则化方向信号+量化参考值）、"
+        "数据可用性清单。"
         "**本工具不输出任何预测结论**——方向、涨跌幅区间、置信度需你基于这些数据自行研判，"
         "并明确标注盘中/非盘中口径差异与数据缺失情况。输入为股票代码（如 600519）。"
     )
@@ -341,6 +387,7 @@ class StockPredictTool:
             lines += _fmt_index(snap.get("index"))
             lines += _fmt_news(snap.get("news"))
             lines += _fmt_macro(snap.get("margin"), snap.get("north_flow"), snap.get("unlock"))
+            lines += _fmt_advice(snap.get("advice_signals"))
             lines += _fmt_quality(snap.get("data_quality") or {})
 
             lines.append("")
