@@ -218,6 +218,9 @@ export default {
         (k) => this.quality[k] === "error",
       );
     },
+    advice() {
+      return (this.snap && this.snap.advice_signals) || null;
+    },
     disclaimer() {
       return (this.snap && this.snap.disclaimer) || FALLBACK_DISCLAIMER;
     },
@@ -513,10 +516,34 @@ export default {
           "注意：以下数据源本次获取失败，分析时请说明：" + this.failedSources.join("、"),
         );
       }
+      const adv = this.advice;
+      if (adv && adv.direction) {
+        const targets = adv.targets || {};
+        const posTxt = { light: "轻仓", half: "半仓", heavy: "重仓" }[adv.position] || "观望";
+        const ratioTxt =
+          typeof adv.position_ratio === "number"
+            ? Math.round(adv.position_ratio * 100) + "%"
+            : "—";
+        lines.push(
+          "可量化操作建议（规则化信号模板，供参考，非买卖指令）：方向 " +
+            { bullish: "偏多", bearish: "偏空", neutral: "中性" }[adv.direction] +
+            "（得分 " + this.fmt(adv.direction_score, 1) + "），" +
+            "入场参考 " + this.fmt(adv.entry_ref) +
+            "，止损 " + this.fmt(adv.stop_loss) +
+            "，目标价 T+1 " + this.fmt(targets.t1) +
+            " / T+5 " + this.fmt(targets.t5) +
+            " / T+20 " + this.fmt(targets.t20) +
+            "，建议仓位 " + posTxt + "（" + ratioTxt + "）" +
+            "，时间窗口 " + (adv.timeframe || []).join("/") +
+            "，依据 " + ((adv.rules_hit || []).join("、") || "无") +
+            "，数据充分度 " + (adv.signal_quality || "--"),
+        );
+      }
       lines.push("");
       lines.push(
         "请基于以上数据，从技术面、资金面、情绪面、大盘环境、消息面多维度分析，" +
-          "给出你的判断（方向倾向、关键依据、主要风险）。" +
+          "给出你的判断（方向倾向、关键依据、主要风险），并参考「可量化操作建议」块" +
+          "给出量化参考（入场/止损/目标价/仓位），若你的判断与信号方向相反请说明理由。" +
           (intra ? "注意：当前为盘中，请结合盘中走势分析。" : "当前为收盘后数据。"),
       );
 
