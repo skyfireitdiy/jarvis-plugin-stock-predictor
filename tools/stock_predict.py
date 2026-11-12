@@ -125,8 +125,9 @@ def _fmt_indicators(ind):
     return lines
 
 
-def _fmt_cyq(cyq):
-    lines = ["", "【筹码分布（CYQ，东财源）】"]
+def _fmt_cyq(cyq, source=None):
+    src_txt = {"eastmoney": "东财源", "tencent_local": "腾讯源本地计算"}.get(source, "东财源")
+    lines = [f"", f"【筹码分布（CYQ，{src_txt}）】"]
     if not cyq:
         lines.append("  筹码分布数据不可用（数据源限流或接口异常）。")
         return lines
@@ -381,7 +382,7 @@ class StockPredictTool:
             lines += _fmt_intraday(snap.get("intraday"))
             lines += _fmt_indicators(snap.get("indicators"))
             lines += _fmt_kline(snap.get("kline"), n=10)
-            lines += _fmt_cyq(snap.get("cyq"))
+            lines += _fmt_cyq(snap.get("cyq"), snap.get("cyq_source"))
             lines += _fmt_fund_flow(snap.get("fund_flow"))
             lines += _fmt_zt(snap.get("zt_pool"))
             lines += _fmt_index(snap.get("index"))

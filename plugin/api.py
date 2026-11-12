@@ -832,36 +832,220 @@ def _compute_atr(df, n=14):
 # 获利盘比例（0~1）来自 akshare stock_cyq_em 的"获利比例"列。
 _cyq_cache = {"data": {}, "ts": {}}  # code -> DataFrame, TTL 30min
 
+# 筹码分布本地计算参数（腾讯日K源降级时使用）
+_CYQ_DECAY = 0.98      # 历史筹码衰减因子（模拟换手衰减，主流软件常用 0.98~1.0）
+_CYQ_STEP = 0.05       # 价格网格步长（元）
+_CYQ_TX_DAYS = 120     # 腾讯日K回溯天数
+
+
+def _tx_symbol(symbol):
+    """把 6 位代码转为腾讯接口所需的带交易所前缀形式，如 301110 -> sz301110。"""
+    code = norm_symbol(symbol)
+    if code.startswith(("6", "9")):
+        return "sh" + code
+    if code.startswith(("4", "8")):
+        return "bj" + code
+    return "sz" + code
+
+
+def _fetch_kline_tx(symbol, days=_CYQ_TX_DAYS):
+    """从腾讯接口拉取日K（前复权）。
+
+    返回 list[dict]，每项 {date, open, close, high, low, volume}，按日期升序；
+    失败返回 []，不抛异常。volume 单位为"手"（腾讯口径，1手=100股），
+    筹码分布只用相对比例，单位不影响结果。
+    """
+    if _requests is None:
+        return []
+    code = norm_symbol(symbol)
+    tx = _tx_symbol(code)
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={tx},day,,,{days},qfq"
+    try:
+        r = _requests.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://gu.qq.com/",
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        node = (data.get("data") or {}).get(tx) or {}
+        kl = node.get("qfqday") or node.get("day") or []
+        bars = []
+        for row in kl:
+            try:
+                # 字段顺序：[date, open, close, high, low, volume]
+                bars.append({
+                    "date": str(row[0]),
+                    "open": float(row[1]),
+                    "close": float(row[2]),
+                    "high": float(row[3]),
+                    "low": float(row[4]),
+                    "volume": float(row[5]),
+                })
+            except Exception:  # noqa: BLE001
+                continue
+        bars = [b for b in bars if b["close"] > 0 and b["volume"] > 0]
+        return bars
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _calc_cyq_local(bars, decay=_CYQ_DECAY, step=_CYQ_STEP):
+    """基于历史日K本地计算筹码分布（三角分布 + 历史衰减）。
+
+    返回与 akshare stock_cyq_em 相同结构的 DataFrame（按日期升序，每根K线一行）：
+      日期 / 获利比例(0~1) / 平均成本 / 90成本-低 / 90成本-高 / 90集中度 /
+      70成本-低 / 70成本-高 / 70集中度
+    数据不足（<2 根K线）返回空 DataFrame。
+    """
+    cols = [
+        "日期", "获利比例", "平均成本",
+        "90成本-低", "90成本-高", "90集中度",
+        "70成本-低", "70成本-高", "70集中度",
+    ]
+    if not bars or len(bars) < 2:
+        return pd.DataFrame(columns=cols)
+    all_lo = min(b["low"] for b in bars)
+    all_hi = max(b["high"] for b in bars)
+    if all_hi <= all_lo:
+        return pd.DataFrame(columns=cols)
+    # 价格网格
+    prices = []
+    p = all_lo
+    while p <= all_hi + 1e-9:
+        prices.append(round(p, 2))
+        p += step
+    if not prices:
+        return pd.DataFrame(columns=cols)
+    n = len(prices)
+
+    def _distribute(lo, hi, vol):
+        """三角分布：把当日成交量按三角形权重分配到 [lo, hi] 网格点，峰值在 (lo+hi)/2。"""
+        if hi <= lo or vol <= 0:
+            return None
+        mid = (lo + hi) / 2
+        weights = {}
+        for pr in prices:
+            if pr < lo or pr > hi:
+                continue
+            if pr <= mid:
+                w = (pr - lo) / (mid - lo) if mid > lo else 1.0
+            else:
+                w = (hi - pr) / (hi - mid) if hi > mid else 1.0
+            if w > 0:
+                weights[pr] = w
+        s = sum(weights.values())
+        if s <= 0:
+            return None
+        return {pr: v / s * vol for pr, v in weights.items()}
+
+    # 逐日累计（含历史衰减）
+    chip = {pr: 0.0 for pr in prices}
+    for b in bars:
+        for pr in chip:
+            chip[pr] *= decay
+        dist = _distribute(b["low"], b["high"], b["volume"])
+        if dist:
+            for pr, v in dist.items():
+                chip[pr] += v
+
+    total = sum(chip.values())
+    if total <= 0:
+        return pd.DataFrame(columns=cols)
+
+    def _cost_range(pct):
+        """返回累计筹码占比落在 [(1-pct)/2, (1+pct)/2] 的价格区间与集中度。"""
+        lo = hi = None
+        acc = 0.0
+        for pr in prices:
+            acc += chip[pr]
+            if lo is None and acc >= total * (1 - pct) / 2:
+                lo = pr
+            if acc >= total * (1 + pct) / 2:
+                hi = pr
+                break
+        if hi is None:
+            hi = prices[-1]
+        conc = (hi - lo) / (hi + lo) if (lo is not None and hi + lo > 0) else 0.0
+        return lo, hi, conc
+
+    lo90, hi90, conc90 = _cost_range(0.90)
+    lo70, hi70, conc70 = _cost_range(0.70)
+
+    rows = []
+    for b in bars:
+        close = b["close"]
+        profit = sum(v for pr, v in chip.items() if pr <= close) / total
+        avg = sum(pr * v for pr, v in chip.items()) / total
+        rows.append({
+            "日期": b["date"],
+            "获利比例": round(profit, 4),
+            "平均成本": round(avg, 2),
+            "90成本-低": round(lo90, 2), "90成本-高": round(hi90, 2), "90集中度": round(conc90, 4),
+            "70成本-低": round(lo70, 2), "70成本-高": round(hi70, 2), "70集中度": round(conc70, 4),
+        })
+    df = pd.DataFrame(rows, columns=cols)
+    df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return df
+
 
 def get_cyq(symbol):
-    """获取 A 股筹码分布（CYQ）原始数据（东财源 stock_cyq_em）。
+    """获取 A 股筹码分布（CYQ）原始数据。
+
+    主路径：东财源（akshare stock_cyq_em）。
+    降级路径：东财源失败（接口异常/限流/被屏蔽）时，改用腾讯日K源本地计算
+    （三角分布 + 历史衰减），保证筹码类指标（CYQ/CY*）在数据源受限时仍可用。
 
     返回列：日期 / 获利比例(0~1) / 平均成本 / 90成本-低 / 90成本-高 / 90集中度 /
             70成本-低 / 70成本-高 / 70集中度。
-    带模块级缓存（TTL 30min），失败返回空 DataFrame，不抛异常。
+    DataFrame 的 attrs["source"] 标注数据源：eastmoney / tencent_local。
+    带模块级缓存（TTL 30min），主路径与降级路径均失败时返回空 DataFrame，不抛异常。
     """
-    if ak is None:
-        return pd.DataFrame()
     code = norm_symbol(symbol)
     now = time.time()
     if code in _cyq_cache["data"] and now - _cyq_cache["ts"].get(code, 0) < 30 * 60:
         return _cyq_cache["data"][code]
-    try:
-        df = with_retry(1, 0.5)(ak.stock_cyq_em)(symbol=code, adjust="")
-        if df is not None and not df.empty:
-            df = df.copy()
-            # 统一日期列为字符串，数值列转 float
-            if "日期" in df.columns:
-                df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
-            for c in df.columns:
-                if c != "日期":
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-            _cyq_cache["data"][code] = df
-            _cyq_cache["ts"][code] = now
-            return df
-    except Exception:  # noqa: BLE001
-        pass
-    return pd.DataFrame()
+
+    # 主路径：东财源
+    df = pd.DataFrame()
+    source = None
+    if ak is not None:
+        try:
+            df = with_retry(1, 0.5)(ak.stock_cyq_em)(symbol=code, adjust="")
+            if df is not None and not df.empty:
+                df = df.copy()
+                # 统一日期列为字符串，数值列转 float
+                if "日期" in df.columns:
+                    df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+                for c in df.columns:
+                    if c != "日期":
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                source = "eastmoney"
+            else:
+                df = pd.DataFrame()
+        except Exception:  # noqa: BLE001
+            df = pd.DataFrame()
+
+    # 降级路径：东财失败 → 腾讯日K源本地计算
+    if df.empty:
+        try:
+            bars = _fetch_kline_tx(code)
+            if bars:
+                df = _calc_cyq_local(bars)
+                if not df.empty:
+                    source = "tencent_local"
+        except Exception:  # noqa: BLE001
+            df = pd.DataFrame()
+
+    if not df.empty and source:
+        df.attrs["source"] = source
+        _cyq_cache["data"][code] = df
+        _cyq_cache["ts"][code] = now
+    return df
 
 
 def _calc_cy_indicators(df, cyq_df):
@@ -1298,11 +1482,15 @@ def get_snapshot(symbol, days=120, sections=None):
     # 1b) 筹码分布（CYQ）独立数据块
     if "cyq" not in secs:
         snap["cyq"] = None
+        snap["cyq_source"] = None
     elif cyq_df is not None and not cyq_df.empty:
         snap["cyq"] = _df_to_records(cyq_df, limit=30)
+        # 透传数据源（DataFrame attrs 经 _df_to_records 后丢失，单独存字段）
+        snap["cyq_source"] = getattr(cyq_df, "attrs", {}).get("source", "eastmoney")
         quality.setdefault("cyq", "ok")
     else:
         snap["cyq"] = None
+        snap["cyq_source"] = None
         quality.setdefault("cyq", "empty")
 
     # 2) 盘中快照
